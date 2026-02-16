@@ -253,17 +253,89 @@ app.post('/chat', async (req: Request, res: Response) => {
 
 app.post('/meal-plan', async (req: Request, res: Response) => {
   try {
-    const mealPlanData = req.body;
+    const { user_id, plan_name, servings, recipes } = req.body;
 
-    // TODO: Validate meal plan payload (plan_name, servings, recipes array)
-    // TODO: Fetch user_id from request (auth/session) or require in body
-    // TODO: Insert into meal_plans (user_id, plan_name, total_estimated_cost, servings, status)
-    // TODO: For each recipe: insert into recipes (meal_plan_id, day_of_week, meal_slot, ...)
-    // TODO: For each ingredient in each recipe: insert into ingredients (recipe_id, ...)
-    // TODO: Calculate and update total_estimated_cost on meal_plans
-    // TODO: Return { meal_plan_id: number, ... }
+    if (
+      typeof user_id !== 'number' ||
+      !Number.isInteger(user_id) ||
+      user_id < 1 ||
+      typeof plan_name !== 'string' ||
+      !plan_name.trim() ||
+      typeof servings !== 'number' ||
+      !Number.isInteger(servings) ||
+      servings < 1 ||
+      !Array.isArray(recipes) ||
+      recipes.length === 0
+    ) {
+      return res.status(400).json({
+        error: 'Invalid request. Required: user_id (positive integer), plan_name (string), servings (positive integer), recipes (non-empty array)',
+      });
+    }
 
-    res.status(501).json({ error: 'Not implemented' });
+    const client = await pool.connect();
+    try {
+      let totalEstimatedCost = 0;
+
+      const mealPlanResult = await client.query(
+        `INSERT INTO meal_plans (user_id, plan_name, total_estimated_cost, servings, status)
+         VALUES ($1, $2, 0, $3, 'draft') RETURNING id`,
+        [user_id, plan_name.trim(), servings]
+      );
+      const mealPlanId = mealPlanResult.rows[0].id as number;
+
+      for (const r of recipes) {
+        const dayOfWeek = (r.day_of_week || 'Monday').toString().slice(0, 20);
+        const mealSlot = (r.meal_slot || 'dinner').toString().slice(0, 50);
+        const title = (r.title || 'Untitled').toString().slice(0, 255);
+        const instructions = (r.instructions || '').toString();
+        const prepTime = typeof r.prep_time === 'number' ? r.prep_time : null;
+        const cookTime = typeof r.cook_time === 'number' ? r.cook_time : null;
+        const estimatedCost = typeof r.estimated_cost === 'number' ? r.estimated_cost : 0;
+        const calories = typeof r.calories === 'number' ? r.calories : null;
+        const protein = typeof r.protein === 'number' ? r.protein : null;
+        const carbs = typeof r.carbs === 'number' ? r.carbs : null;
+        const fat = typeof r.fat === 'number' ? r.fat : null;
+
+        totalEstimatedCost += estimatedCost;
+
+        const recipeResult = await client.query(
+          `INSERT INTO recipes (meal_plan_id, day_of_week, meal_slot, title, instructions, prep_time, cook_time, estimated_cost, calories, protein, carbs, fat)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+          [mealPlanId, dayOfWeek, mealSlot, title, instructions, prepTime, cookTime, estimatedCost, calories, protein, carbs, fat]
+        );
+        const recipeId = recipeResult.rows[0].id as number;
+
+        const ingredients = Array.isArray(r.ingredients) ? r.ingredients : [];
+        for (const ing of ingredients) {
+          const ingredientName = (ing.ingredient_name || 'Unknown').toString().slice(0, 255);
+          const quantity = typeof ing.quantity === 'number' ? ing.quantity : null;
+          const unit = ing.unit != null ? String(ing.unit).slice(0, 50) : null;
+          const category = ing.category != null ? String(ing.category).slice(0, 100) : null;
+          const estimatedPrice = typeof ing.estimated_price === 'number' ? ing.estimated_price : null;
+
+          await client.query(
+            `INSERT INTO ingredients (recipe_id, ingredient_name, quantity, unit, category, estimated_price)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [recipeId, ingredientName, quantity, unit, category, estimatedPrice]
+          );
+        }
+      }
+
+      await client.query(
+        'UPDATE meal_plans SET total_estimated_cost = $1 WHERE id = $2',
+        [totalEstimatedCost, mealPlanId]
+      );
+
+      res.status(201).json({
+        meal_plan_id: mealPlanId,
+        plan_name: plan_name.trim(),
+        total_estimated_cost: totalEstimatedCost,
+        servings,
+        recipes_count: recipes.length,
+      });
+    } finally {
+      client.release();
+    }
   } catch (err) {
     log('ERROR', 'POST /meal-plan failed', { err: String(err) });
     res.status(500).json({ error: 'Internal server error' });
@@ -273,32 +345,138 @@ app.post('/meal-plan', async (req: Request, res: Response) => {
 app.get('/shopping-list/:plan_id', async (req: Request, res: Response) => {
   try {
     const planId = parseInt(req.params.plan_id, 10);
+    if (isNaN(planId) || planId < 1) {
+      return res.status(400).json({ error: 'Invalid plan_id. Must be a positive integer.' });
+    }
 
-    // TODO: Validate plan_id
-    // TODO: Check meal plan exists and user has access
-    // TODO: Create shopping_lists row for meal_plan_id if not exists
-    // TODO: Aggregate ingredients from all recipes in plan (sum quantities by ingredient_name + unit)
-    // TODO: Insert/upsert into shopping_list_items
-    // TODO: Calculate total_cost
-    // TODO: Return { shopping_list_id, items: [...], total_cost }
+    const client = await pool.connect();
+    try {
+      const planResult = await client.query(
+        'SELECT id FROM meal_plans WHERE id = $1',
+        [planId]
+      );
+      if (planResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Meal plan not found' });
+      }
 
-    res.status(501).json({ error: 'Not implemented' });
+      let listResult = await client.query(
+        'SELECT id FROM shopping_lists WHERE meal_plan_id = $1',
+        [planId]
+      );
+      let shoppingListId: number;
+
+      if (listResult.rows.length === 0) {
+        const insertResult = await client.query(
+          'INSERT INTO shopping_lists (meal_plan_id, total_cost) VALUES ($1, 0) RETURNING id',
+          [planId]
+        );
+        shoppingListId = insertResult.rows[0].id as number;
+      } else {
+        shoppingListId = listResult.rows[0].id as number;
+        await client.query('DELETE FROM shopping_list_items WHERE shopping_list_id = $1', [shoppingListId]);
+      }
+
+      const aggResult = await client.query(
+        `SELECT
+           i.ingredient_name,
+           COALESCE(i.unit, '') AS unit,
+           i.category,
+           SUM(i.quantity) AS quantity,
+           SUM(i.estimated_price) AS estimated_price
+         FROM ingredients i
+         JOIN recipes r ON r.id = i.recipe_id
+         WHERE r.meal_plan_id = $1
+         GROUP BY i.ingredient_name, COALESCE(i.unit, ''), i.category`,
+        [planId]
+      );
+
+      let totalCost = 0;
+      for (const row of aggResult.rows) {
+        const qty = row.quantity != null ? parseFloat(row.quantity) : null;
+        const price = row.estimated_price != null ? parseFloat(row.estimated_price) : null;
+        if (price != null) totalCost += price;
+
+        await client.query(
+          `INSERT INTO shopping_list_items (shopping_list_id, ingredient_name, quantity, unit, category, estimated_price, checked)
+           VALUES ($1, $2, $3, $4, $5, $6, FALSE)`,
+          [
+            shoppingListId,
+            row.ingredient_name,
+            qty,
+            row.unit === '' ? null : row.unit,
+            row.category,
+            price,
+          ]
+        );
+      }
+
+      await client.query(
+        'UPDATE shopping_lists SET total_cost = $1 WHERE id = $2',
+        [totalCost, shoppingListId]
+      );
+
+      const itemsResult = await client.query(
+        `SELECT ingredient_name, quantity, unit, category, estimated_price, checked
+         FROM shopping_list_items WHERE shopping_list_id = $1 ORDER BY category NULLS LAST, ingredient_name`,
+        [shoppingListId]
+      );
+
+      res.json({
+        shopping_list_id: shoppingListId,
+        plan_id: planId,
+        items: itemsResult.rows.map((r) => ({
+          ingredient_name: r.ingredient_name,
+          quantity: r.quantity,
+          unit: r.unit,
+          category: r.category,
+          estimated_price: r.estimated_price,
+          checked: r.checked,
+        })),
+        total_cost: totalCost,
+      });
+    } finally {
+      client.release();
+    }
   } catch (err) {
     log('ERROR', 'GET /shopping-list/:plan_id failed', { err: String(err) });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+const RETAILERS = ['tesco', 'sainsburys'] as const;
+type Retailer = (typeof RETAILERS)[number];
+
+function buildRetailerSearchUrl(retailer: Retailer, searchQuery: string): string {
+  const encoded = encodeURIComponent(searchQuery.trim());
+  const utmSource = process.env.UTM_SOURCE || 'my-food-sorted';
+
+  switch (retailer) {
+    case 'tesco':
+      return `https://www.tesco.com/groceries/en-GB/search?query=${encoded}&utm_source=${encodeURIComponent(utmSource)}`;
+    case 'sainsburys':
+      return `https://www.sainsburys.co.uk/gol-ui/SearchDisplayView?searchTerm=${encoded}&utm_source=${encodeURIComponent(utmSource)}`;
+    default:
+      throw new Error(`Unknown retailer: ${retailer}`);
+  }
+}
+
 app.post('/affiliate-link', async (req: Request, res: Response) => {
   try {
     const { retailer, search_query } = req.body;
 
-    // TODO: Validate retailer ('tesco' | 'sainsburys') and search_query
-    // TODO: Build affiliate URL for Tesco or Sainsbury's search
-    // TODO: Apply affiliate tracking params if configured
-    // TODO: Return { url: string }
+    if (
+      typeof retailer !== 'string' ||
+      !RETAILERS.includes(retailer.toLowerCase() as Retailer) ||
+      typeof search_query !== 'string' ||
+      !search_query.trim()
+    ) {
+      return res.status(400).json({
+        error: 'Invalid request. Required: retailer ("tesco" | "sainsburys"), search_query (non-empty string)',
+      });
+    }
 
-    res.status(501).json({ error: 'Not implemented' });
+    const url = buildRetailerSearchUrl(retailer.toLowerCase() as Retailer, search_query);
+    res.json({ url });
   } catch (err) {
     log('ERROR', 'POST /affiliate-link failed', { err: String(err) });
     res.status(500).json({ error: 'Internal server error' });
