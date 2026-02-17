@@ -313,6 +313,21 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
     const client = await pool.connect();
 
     try {
+      const countResult = await client.query<{ message_count: number }>(
+        'SELECT message_count FROM users WHERE id = $1',
+        [user_id]
+      );
+      const messageCount = countResult.rows[0]?.message_count ?? 0;
+      if (messageCount >= 10) {
+        client.release();
+        return res.status(429).json({ error: 'You have reached your 10 messages limit' });
+      }
+
+      await client.query(
+        'UPDATE users SET message_count = message_count + 1 WHERE id = $1',
+        [user_id]
+      );
+
       await client.query('INSERT INTO chat_messages (user_id, sender, message_text, conversation_id) VALUES ($1, $2, $3, $4)', [
         user_id,
         'user',

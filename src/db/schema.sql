@@ -10,6 +10,7 @@ CREATE TABLE users (
   allergies TEXT,
   household_size INT DEFAULT 1,
   default_budget DECIMAL(10, 2),
+  message_count INT DEFAULT 0,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
