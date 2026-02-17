@@ -203,7 +203,7 @@ app.post('/register', async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
 
-    if (typeof email !== 'string' || !email.trim() || !/^[\w-.]+@([\w-]+\.)+[\w-]{2,4}$/.test(email)) {
+    if (typeof email !== 'string' || !email.trim() || !email.includes('@') || !email.includes('.')) {
       return res.status(400).json({ error: 'Valid email is required' });
     }
     if (typeof password !== 'string' || password.length < 8) {
