@@ -1,5 +1,8 @@
 import 'dotenv/config';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 import express, { Request, Response, NextFunction } from 'express';
+import { authenticateToken, AuthenticatedRequest } from './middleware/auth';
 import { Pool } from 'pg';
 import cors from 'cors';
 
@@ -10,6 +13,7 @@ import cors from 'cors';
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DATABASE_URL = process.env.DATABASE_URL;
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+const JWT_SECRET = process.env.JWT_SECRET || 'supersecretjwtkey';
 
 if (!DATABASE_URL) {
   console.error('FATAL: DATABASE_URL is required. Set it in .env');
@@ -108,7 +112,7 @@ async function callClaudeAPI(
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5-20250929',
       max_tokens: 4096,
       system: systemPrompt,
       messages: messages.map((m) => ({
@@ -167,6 +171,16 @@ function parseRecipeJSON(text: string): ParsedMealPlan | null {
   }
 }
 
+/** Remove the meal-plan JSON block from assistant text so the chat shows only conversational content. */
+function messageWithoutJsonBlock(text: string): string {
+  // Remove entire ```json ... ``` code block (greedy match to closing ```)
+  let out = text.replace(/```json\s*[\s\S]*?```/g, '');
+  // If no fenced block, remove raw { ... } that we parse as meal plan
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (jsonMatch) out = out.replace(jsonMatch[0], '');
+  return out.replace(/\n{3,}/g, '\n\n').trim() || text;
+}
+
 // ---------------------------------------------------------------------------
 // Express App
 // ---------------------------------------------------------------------------
@@ -182,24 +196,113 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
 });
 
 // ---------------------------------------------------------------------------
-// Routes
+// Authentication Routes
 // ---------------------------------------------------------------------------
 
-app.post('/chat', async (req: Request, res: Response) => {
+app.post('/register', async (req: Request, res: Response) => {
   try {
-    const { user_message, conversation_id, user_id } = req.body;
+    const { email, password } = req.body;
+
+    if (typeof email !== 'string' || !email.trim() || !/^[\w-.]+@([\w-]+\.)+[\w-]{2,4}$/.test(email)) {
+      return res.status(400).json({ error: 'Valid email is required' });
+    }
+    if (typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    }
+
+    const client = await pool.connect();
+    try {
+      const hashedPassword = await bcrypt.hash(password, 10);
+      const result = await client.query(
+        'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email',
+        [email.trim(), hashedPassword]
+      );
+      const user = result.rows[0];
+      const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1h' });
+      res.status(201).json({
+        message: 'User registered successfully',
+        token,
+        userId: user.id,
+        email: user.email,
+      });
+    } catch (err: unknown) {
+      const pgErr = err as { code?: string };
+      if (pgErr?.code === '23505') {
+        return res.status(409).json({ error: 'Email already registered' });
+      }
+      log('ERROR', 'POST /register failed', { err: String(err) });
+      res.status(500).json({ error: 'Internal server error' });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /register failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/login', async (req: Request, res: Response) => {
+  try {
+    const { email, password } = req.body;
+
+    if (typeof email !== 'string' || !email.trim() || typeof password !== 'string' || !password.trim()) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        'SELECT id, email, password_hash FROM users WHERE email = $1',
+        [email.trim()]
+      );
+      const user = result.rows[0];
+
+      if (!user) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+
+      const passwordMatch = await bcrypt.compare(password, user.password_hash);
+      if (!passwordMatch) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+
+      const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1h' });
+      res.json({
+        message: 'Logged in successfully',
+        token,
+        userId: user.id,
+        email: user.email,
+      });
+    } catch (err) {
+      log('ERROR', 'POST /login failed', { err: String(err) });
+      res.status(500).json({ error: 'Internal server error' });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /login failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Protected Routes
+// ---------------------------------------------------------------------------
+
+app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { user_message, conversation_id } = req.body;
+    const user_id = (req as AuthenticatedRequest).user?.userId;
 
     if (
       typeof user_message !== 'string' ||
       !user_message.trim() ||
       typeof conversation_id !== 'string' ||
       !conversation_id.trim() ||
-      typeof user_id !== 'number' ||
-      !Number.isInteger(user_id) ||
-      user_id < 1
+      user_id == null
     ) {
       return res.status(400).json({
-        error: 'Invalid request. Required: user_message (string), conversation_id (string), user_id (positive integer)',
+        error: 'Invalid request. Required: user_message (string), conversation_id (string). Auth token required.',
       });
     }
 
@@ -237,28 +340,32 @@ app.post('/chat', async (req: Request, res: Response) => {
       );
 
       const mealPlan = parseRecipeJSON(assistantText);
+      const displayMessage = mealPlan ? messageWithoutJsonBlock(assistantText) : assistantText;
 
       res.json({
-        message: assistantText,
+        message: displayMessage,
         ...(mealPlan && { meal_plan: mealPlan }),
       });
     } finally {
       client.release();
     }
   } catch (err) {
-    log('ERROR', 'POST /chat failed', { err: String(err) });
-    res.status(500).json({ error: 'Internal server error' });
+    const errMsg = err instanceof Error ? err.message : String(err);
+    log('ERROR', 'POST /chat failed', { err: errMsg });
+    res.status(500).json({
+      error: 'Internal server error',
+      detail: process.env.NODE_ENV !== 'production' ? errMsg : undefined,
+    });
   }
 });
 
-app.post('/meal-plan', async (req: Request, res: Response) => {
+app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const { user_id, plan_name, servings, recipes } = req.body;
+    const { plan_name, servings, recipes } = req.body;
+    const user_id = (req as AuthenticatedRequest).user?.userId;
 
     if (
-      typeof user_id !== 'number' ||
-      !Number.isInteger(user_id) ||
-      user_id < 1 ||
+      user_id == null ||
       typeof plan_name !== 'string' ||
       !plan_name.trim() ||
       typeof servings !== 'number' ||
@@ -268,7 +375,7 @@ app.post('/meal-plan', async (req: Request, res: Response) => {
       recipes.length === 0
     ) {
       return res.status(400).json({
-        error: 'Invalid request. Required: user_id (positive integer), plan_name (string), servings (positive integer), recipes (non-empty array)',
+        error: 'Invalid request. Required: plan_name (string), servings (positive integer), recipes (non-empty array). Auth token required.',
       });
     }
 
@@ -342,18 +449,22 @@ app.post('/meal-plan', async (req: Request, res: Response) => {
   }
 });
 
-app.get('/shopping-list/:plan_id', async (req: Request, res: Response) => {
+app.get('/shopping-list/:plan_id', authenticateToken, async (req: Request, res: Response) => {
   try {
     const planId = parseInt(req.params.plan_id, 10);
+    const user_id = (req as AuthenticatedRequest).user?.userId;
     if (isNaN(planId) || planId < 1) {
       return res.status(400).json({ error: 'Invalid plan_id. Must be a positive integer.' });
+    }
+    if (user_id == null) {
+      return res.status(401).json({ error: 'Authentication required.' });
     }
 
     const client = await pool.connect();
     try {
       const planResult = await client.query(
-        'SELECT id FROM meal_plans WHERE id = $1',
-        [planId]
+        'SELECT id FROM meal_plans WHERE id = $1 AND user_id = $2',
+        [planId, user_id]
       );
       if (planResult.rows.length === 0) {
         return res.status(404).json({ error: 'Meal plan not found' });
@@ -460,7 +571,7 @@ function buildRetailerSearchUrl(retailer: Retailer, searchQuery: string): string
   }
 }
 
-app.post('/affiliate-link', async (req: Request, res: Response) => {
+app.post('/affiliate-link', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { retailer, search_query } = req.body;
 

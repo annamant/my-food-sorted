@@ -5,6 +5,7 @@
 CREATE TABLE users (
   id SERIAL PRIMARY KEY,
   email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
   dietary_preferences TEXT,
   allergies TEXT,
   household_size INT DEFAULT 1,
