@@ -22,7 +22,7 @@ export function authenticateToken(
   if (token == null) return res.sendStatus(401);
 
   jwt.verify(token, config.JWT_SECRET, (err, decoded) => {
-    if (err) return res.sendStatus(403);
+    if (err) return res.sendStatus(401);
     req.user = decoded as JwtPayload;
     next();
   });

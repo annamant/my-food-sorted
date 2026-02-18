@@ -78,7 +78,7 @@ Your responsibilities:
 - Be concise, friendly, and helpful. If the user's message doesn't require a meal plan, respond conversationally without JSON.`;
 
 interface ClaudeMessage {
-  role: 'user' | 'assistant' | 'system';
+  role: 'user' | 'assistant';
   content: string;
 }
 
@@ -145,26 +145,64 @@ interface ParsedMealPlan {
 }
 
 function parseRecipeJSON(text: string): ParsedMealPlan | null {
-  try {
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return null;
-    const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
-    if (parsed && typeof parsed === 'object' && Array.isArray(parsed.recipes)) {
-      return parsed as unknown as ParsedMealPlan;
+  // Scan for every top-level {...} block and return the first one that contains
+  // a "recipes" array, rather than greedily matching from first { to last }.
+  let depth = 0;
+  let start = -1;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (text[i] === '}') {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        const candidate = text.slice(start, i + 1);
+        try {
+          const parsed = JSON.parse(candidate) as Record<string, unknown>;
+          if (parsed && typeof parsed === 'object' && Array.isArray(parsed.recipes)) {
+            return parsed as unknown as ParsedMealPlan;
+          }
+        } catch {
+          // not valid JSON, keep scanning
+        }
+        start = -1;
+      }
     }
-    return null;
-  } catch {
-    return null;
   }
+  return null;
 }
 
 /** Remove the meal-plan JSON block from assistant text so the chat shows only conversational content. */
 function messageWithoutJsonBlock(text: string): string {
-  // Remove entire ```json ... ``` code block (greedy match to closing ```)
+  // Remove entire ```json ... ``` code block first (non-greedy to closing ```)
   let out = text.replace(/```json\s*[\s\S]*?```/g, '');
-  // If no fenced block, remove raw { ... } that we parse as meal plan
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (jsonMatch) out = out.replace(jsonMatch[0], '');
+
+  // Remove the first top-level {...} block that contains a "recipes" array,
+  // matching the same candidate chosen by parseRecipeJSON.
+  let depth = 0;
+  let start = -1;
+  for (let i = 0; i < out.length; i++) {
+    if (out[i] === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (out[i] === '}') {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        const candidate = out.slice(start, i + 1);
+        try {
+          const parsed = JSON.parse(candidate) as Record<string, unknown>;
+          if (parsed && typeof parsed === 'object' && Array.isArray(parsed.recipes)) {
+            out = out.slice(0, start) + out.slice(i + 1);
+            break;
+          }
+        } catch {
+          // not valid JSON, keep scanning
+        }
+        start = -1;
+      }
+    }
+  }
+
   return out.replace(/\n{3,}/g, '\n\n').trim() || text;
 }
 
@@ -321,7 +359,6 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
         [user_id, config.MESSAGE_QUOTA_PER_USER]
       );
       if (updateResult.rows.length === 0) {
-        client.release();
         return res.status(429).json({
           error: `You have reached your ${config.MESSAGE_QUOTA_PER_USER} messages limit`,
         });
@@ -393,6 +430,9 @@ app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) =>
       });
     }
 
+    const VALID_DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'] as const;
+    const VALID_MEAL_SLOTS = ['breakfast', 'lunch', 'dinner', 'snack'] as const;
+
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -406,8 +446,10 @@ app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) =>
       const mealPlanId = mealPlanResult.rows[0].id;
 
       for (const r of recipes) {
-        const dayOfWeek = (r.day_of_week || 'Monday').toString().slice(0, 20);
-        const mealSlot = (r.meal_slot || 'dinner').toString().slice(0, 50);
+        const rawDay = (r.day_of_week || '').toString();
+        const dayOfWeek = (VALID_DAYS as readonly string[]).includes(rawDay) ? rawDay : 'Monday';
+        const rawSlot = (r.meal_slot || '').toString();
+        const mealSlot = (VALID_MEAL_SLOTS as readonly string[]).includes(rawSlot) ? rawSlot : 'dinner';
         const title = (r.title || 'Untitled').toString().slice(0, 255);
         const instructions = (r.instructions || '').toString();
         const prepTime = typeof r.prep_time === 'number' ? r.prep_time : null;
@@ -490,74 +532,82 @@ app.get('/shopping-list/:plan_id', authenticateToken, async (req: Request, res: 
         return res.status(404).json({ error: 'Meal plan not found' });
       }
 
-      const upsertResult = await client.query<{ id: number }>(
-        `INSERT INTO shopping_lists (meal_plan_id, total_cost)
-         VALUES ($1, 0)
-         ON CONFLICT (meal_plan_id) DO UPDATE SET meal_plan_id = EXCLUDED.meal_plan_id
-         RETURNING id`,
-        [planId]
-      );
-      const shoppingListId = upsertResult.rows[0].id;
-      await client.query('DELETE FROM shopping_list_items WHERE shopping_list_id = $1', [shoppingListId]);
+      await client.query('BEGIN');
+      try {
+        const upsertResult = await client.query<{ id: number }>(
+          `INSERT INTO shopping_lists (meal_plan_id, total_cost)
+           VALUES ($1, 0)
+           ON CONFLICT (meal_plan_id) DO UPDATE SET meal_plan_id = EXCLUDED.meal_plan_id
+           RETURNING id`,
+          [planId]
+        );
+        const shoppingListId = upsertResult.rows[0].id;
+        await client.query('DELETE FROM shopping_list_items WHERE shopping_list_id = $1', [shoppingListId]);
 
-      const aggResult = await client.query(
-        `SELECT
-           i.ingredient_name,
-           COALESCE(i.unit, '') AS unit,
-           i.category,
-           SUM(i.quantity) AS quantity,
-           SUM(i.estimated_price) AS estimated_price
-         FROM ingredients i
-         JOIN recipes r ON r.id = i.recipe_id
-         WHERE r.meal_plan_id = $1
-         GROUP BY i.ingredient_name, COALESCE(i.unit, ''), i.category`,
-        [planId]
-      );
+        const aggResult = await client.query(
+          `SELECT
+             i.ingredient_name,
+             COALESCE(i.unit, '') AS unit,
+             i.category,
+             SUM(i.quantity) AS quantity,
+             SUM(i.estimated_price) AS estimated_price
+           FROM ingredients i
+           JOIN recipes r ON r.id = i.recipe_id
+           WHERE r.meal_plan_id = $1
+           GROUP BY i.ingredient_name, COALESCE(i.unit, ''), i.category`,
+          [planId]
+        );
 
-      let totalCost = 0;
-      for (const row of aggResult.rows) {
-        const qty = row.quantity != null ? parseFloat(row.quantity) : null;
-        const price = row.estimated_price != null ? parseFloat(row.estimated_price) : null;
-        if (price != null) totalCost += price;
+        let totalCost = 0;
+        for (const row of aggResult.rows) {
+          const qty = row.quantity != null ? parseFloat(row.quantity) : null;
+          const price = row.estimated_price != null ? parseFloat(row.estimated_price) : null;
+          if (price != null) totalCost += price;
+
+          await client.query(
+            `INSERT INTO shopping_list_items (shopping_list_id, ingredient_name, quantity, unit, category, estimated_price, checked)
+             VALUES ($1, $2, $3, $4, $5, $6, FALSE)`,
+            [
+              shoppingListId,
+              row.ingredient_name,
+              qty,
+              row.unit === '' ? null : row.unit,
+              row.category,
+              price,
+            ]
+          );
+        }
 
         await client.query(
-          `INSERT INTO shopping_list_items (shopping_list_id, ingredient_name, quantity, unit, category, estimated_price, checked)
-           VALUES ($1, $2, $3, $4, $5, $6, FALSE)`,
-          [
-            shoppingListId,
-            row.ingredient_name,
-            qty,
-            row.unit === '' ? null : row.unit,
-            row.category,
-            price,
-          ]
+          'UPDATE shopping_lists SET total_cost = $1 WHERE id = $2',
+          [totalCost, shoppingListId]
         );
+
+        await client.query('COMMIT');
+
+        const itemsResult = await client.query(
+          `SELECT ingredient_name, quantity, unit, category, estimated_price, checked
+           FROM shopping_list_items WHERE shopping_list_id = $1 ORDER BY category NULLS LAST, ingredient_name`,
+          [shoppingListId]
+        );
+
+        res.json({
+          shopping_list_id: shoppingListId,
+          plan_id: planId,
+          items: itemsResult.rows.map((r) => ({
+            ingredient_name: r.ingredient_name,
+            quantity: r.quantity,
+            unit: r.unit,
+            category: r.category,
+            estimated_price: r.estimated_price,
+            checked: r.checked,
+          })),
+          total_cost: totalCost,
+        });
+      } catch (txErr) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw txErr;
       }
-
-      await client.query(
-        'UPDATE shopping_lists SET total_cost = $1 WHERE id = $2',
-        [totalCost, shoppingListId]
-      );
-
-      const itemsResult = await client.query(
-        `SELECT ingredient_name, quantity, unit, category, estimated_price, checked
-         FROM shopping_list_items WHERE shopping_list_id = $1 ORDER BY category NULLS LAST, ingredient_name`,
-        [shoppingListId]
-      );
-
-      res.json({
-        shopping_list_id: shoppingListId,
-        plan_id: planId,
-        items: itemsResult.rows.map((r) => ({
-          ingredient_name: r.ingredient_name,
-          quantity: r.quantity,
-          unit: r.unit,
-          category: r.category,
-          estimated_price: r.estimated_price,
-          checked: r.checked,
-        })),
-        total_cost: totalCost,
-      });
     } finally {
       client.release();
     }
@@ -569,7 +619,7 @@ app.get('/shopping-list/:plan_id', authenticateToken, async (req: Request, res: 
 
 function buildRetailerSearchUrl(retailer: Retailer, searchQuery: string): string {
   const encoded = encodeURIComponent(searchQuery.trim());
-  const utmSource = process.env.UTM_SOURCE || 'my-food-sorted';
+  const utmSource = config.UTM_SOURCE;
 
   switch (retailer) {
     case 'tesco':
@@ -605,8 +655,12 @@ app.post('/affiliate-link', authenticateToken, async (req: Request, res: Respons
 });
 
 // ---------------------------------------------------------------------------
-// Error Handler & Server Start
+// 404 & Error Handlers
 // ---------------------------------------------------------------------------
+
+app.use((_req: Request, res: Response) => {
+  res.status(404).json({ error: 'Not found' });
+});
 
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   log('ERROR', 'Unhandled error', { err: err.message });

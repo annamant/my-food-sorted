@@ -29,11 +29,14 @@ export const config = {
   JSON_BODY_LIMIT: optionalEnv('JSON_BODY_LIMIT', '50kb'),
 
   /** Message limit per user before 429 (reset not implemented; consider daily reset later). */
-  MESSAGE_QUOTA_PER_USER: 10,
+  MESSAGE_QUOTA_PER_USER: parseInt(optionalEnv('MESSAGE_QUOTA_PER_USER', '10'), 10),
 
   /** Claude model and max tokens (for clarity; override via env if needed later). */
   CLAUDE_MODEL: optionalEnv('CLAUDE_MODEL', 'claude-sonnet-4-5-20250929'),
   CLAUDE_MAX_TOKENS: parseInt(optionalEnv('CLAUDE_MAX_TOKENS', '4096'), 10),
+
+  /** UTM source tag appended to retailer affiliate links. */
+  UTM_SOURCE: optionalEnv('UTM_SOURCE', 'my-food-sorted'),
 } as const;
 
 /** Retailers supported for affiliate links. */
