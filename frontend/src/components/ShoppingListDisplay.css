@@ -1,0 +1,76 @@
+.shopping-list-display {
+  padding: var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  background: #111;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.shopping-list-display__title {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.shopping-list-display__generateBtn {
+  width: 100%;
+}
+
+/* ── Category groups ── */
+.shopping-list-display__category {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.shopping-list-display__categoryTitle {
+  font-size: var(--text-sm);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 0;
+}
+.shopping-list-display__list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.shopping-list-display__item {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+}
+.shopping-list-display__price {
+  color: var(--primary);
+  font-weight: 600;
+  font-size: var(--text-xs);
+}
+
+/* ── Retailer picker ── */
+.shopping-list-display__retailer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+.shopping-list-display__retailerTitle {
+  font-size: var(--text-sm);
+  font-weight: 700;
+  color: var(--text-secondary);
+  margin: 0;
+}
+.shopping-list-display__retailerButtons {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
