@@ -1,7 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-
-const JWT_SECRET = process.env.JWT_SECRET || 'supersecretjwtkey';
+import { config } from '../config';
 
 export interface JwtPayload {
   userId: number;
@@ -22,7 +21,7 @@ export function authenticateToken(
 
   if (token == null) return res.sendStatus(401);
 
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+  jwt.verify(token, config.JWT_SECRET, (err, decoded) => {
     if (err) return res.sendStatus(403);
     req.user = decoded as JwtPayload;
     next();

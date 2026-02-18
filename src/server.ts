@@ -2,30 +2,21 @@ import 'dotenv/config';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import express, { Request, Response, NextFunction } from 'express';
+import { rateLimit } from 'express-rate-limit';
+import helmet from 'helmet';
 import { authenticateToken, AuthenticatedRequest } from './middleware/auth';
 import { Pool } from 'pg';
 import cors from 'cors';
+import { config, RETAILERS, type Retailer } from './config';
 
-// ---------------------------------------------------------------------------
-// Environment & Configuration
-// ---------------------------------------------------------------------------
-
-const PORT = parseInt(process.env.PORT || '3000', 10);
-const DATABASE_URL = process.env.DATABASE_URL;
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
-const JWT_SECRET = process.env.JWT_SECRET || 'supersecretjwtkey';
-
-if (!DATABASE_URL) {
-  console.error('FATAL: DATABASE_URL is required. Set it in .env');
-  process.exit(1);
-}
+// Config is validated at import (config.ts); server exits if JWT_SECRET or CLAUDE_API_KEY missing.
 
 // ---------------------------------------------------------------------------
 // Database Connection Pool
 // ---------------------------------------------------------------------------
 
 const pool = new Pool({
-  connectionString: DATABASE_URL,
+  connectionString: config.DATABASE_URL,
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
@@ -100,20 +91,16 @@ async function callClaudeAPI(
   messages: ClaudeMessage[],
   systemPrompt: string = CLAUDE_MEAL_PLANNING_SYSTEM_PROMPT
 ): Promise<string> {
-  if (!CLAUDE_API_KEY) {
-    throw new Error('CLAUDE_API_KEY is not set');
-  }
-
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': CLAUDE_API_KEY,
+      'x-api-key': config.CLAUDE_API_KEY,
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 4096,
+      model: config.CLAUDE_MODEL,
+      max_tokens: config.CLAUDE_MAX_TOKENS,
       system: systemPrompt,
       messages: messages.map((m) => ({
         role: m.role,
@@ -187,8 +174,18 @@ function messageWithoutJsonBlock(text: string): string {
 
 const app = express();
 
-app.use(cors());
-app.use(express.json());
+app.use(helmet());
+const corsOrigins = config.CORS_ORIGINS === '' || config.CORS_ORIGINS === '*' ? undefined : config.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean);
+app.use(cors(corsOrigins ? { origin: corsOrigins } : {}));
+app.use(express.json({ limit: config.JSON_BODY_LIMIT }));
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { error: 'Too many attempts. Try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 app.use((req: Request, _res: Response, next: NextFunction) => {
   log('INFO', `${req.method} ${req.path}`, { ip: req.ip });
@@ -196,14 +193,16 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
 });
 
 // ---------------------------------------------------------------------------
-// Authentication Routes
+// Authentication Routes (rate-limited)
 // ---------------------------------------------------------------------------
 
-app.post('/register', async (req: Request, res: Response) => {
+const EMAIL_REGEX = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+
+app.post('/register', authLimiter, async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
 
-    if (typeof email !== 'string' || !email.trim() || !email.includes('@') || !email.includes('.')) {
+    if (typeof email !== 'string' || !email.trim() || !EMAIL_REGEX.test(email.trim())) {
       return res.status(400).json({ error: 'Valid email is required' });
     }
     if (typeof password !== 'string' || password.length < 8) {
@@ -218,7 +217,7 @@ app.post('/register', async (req: Request, res: Response) => {
         [email.trim(), hashedPassword]
       );
       const user = result.rows[0];
-      const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1h' });
+      const token = jwt.sign({ userId: user.id, email: user.email }, config.JWT_SECRET, { expiresIn: '1h' });
       res.status(201).json({
         message: 'User registered successfully',
         token,
@@ -241,11 +240,11 @@ app.post('/register', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/login', async (req: Request, res: Response) => {
+app.post('/login', authLimiter, async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
 
-    if (typeof email !== 'string' || !email.trim() || typeof password !== 'string' || !password.trim()) {
+    if (typeof email !== 'string' || !email.trim() || !EMAIL_REGEX.test(email.trim()) || typeof password !== 'string' || !password.trim()) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
@@ -266,7 +265,7 @@ app.post('/login', async (req: Request, res: Response) => {
         return res.status(401).json({ error: 'Invalid credentials' });
       }
 
-      const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1h' });
+      const token = jwt.sign({ userId: user.id, email: user.email }, config.JWT_SECRET, { expiresIn: '1h' });
       res.json({
         message: 'Logged in successfully',
         token,
@@ -305,41 +304,41 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
         error: 'Invalid request. Required: user_message (string), conversation_id (string). Auth token required.',
       });
     }
-
-    if (!CLAUDE_API_KEY) {
-      return res.status(503).json({ error: 'Claude API is not configured' });
+    const convId = conversation_id.trim();
+    if (convId.length > 100 || !/^[a-zA-Z0-9_-]+$/.test(convId)) {
+      return res.status(400).json({
+        error: 'conversation_id must be 1–100 characters, alphanumeric, hyphen, or underscore only.',
+      });
     }
 
     const client = await pool.connect();
 
     try {
-      const countResult = await client.query<{ message_count: number }>(
-        'SELECT message_count FROM users WHERE id = $1',
-        [user_id]
+      const updateResult = await client.query<{ message_count: number }>(
+        `UPDATE users SET message_count = message_count + 1
+         WHERE id = $1 AND message_count < $2
+         RETURNING message_count`,
+        [user_id, config.MESSAGE_QUOTA_PER_USER]
       );
-      const messageCount = countResult.rows[0]?.message_count ?? 0;
-      if (messageCount >= 10) {
+      if (updateResult.rows.length === 0) {
         client.release();
-        return res.status(429).json({ error: 'You have reached your 10 messages limit' });
+        return res.status(429).json({
+          error: `You have reached your ${config.MESSAGE_QUOTA_PER_USER} messages limit`,
+        });
       }
-
-      await client.query(
-        'UPDATE users SET message_count = message_count + 1 WHERE id = $1',
-        [user_id]
-      );
 
       await client.query('INSERT INTO chat_messages (user_id, sender, message_text, conversation_id) VALUES ($1, $2, $3, $4)', [
         user_id,
         'user',
         user_message.trim(),
-        conversation_id.trim().slice(0, 100),
+        convId,
       ]);
 
       const historyResult = await client.query(
         `SELECT sender, message_text FROM chat_messages 
          WHERE conversation_id = $1 AND user_id = $2 
          ORDER BY timestamp ASC`,
-        [conversation_id.trim(), user_id]
+        [convId, user_id]
       );
 
       const messages: ClaudeMessage[] = historyResult.rows.map((row: { sender: string; message_text: string }) => ({
@@ -351,7 +350,7 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
 
       await client.query(
         'INSERT INTO chat_messages (user_id, sender, message_text, conversation_id) VALUES ($1, $2, $3, $4)',
-        [user_id, 'assistant', assistantText, conversation_id.trim().slice(0, 100)]
+        [user_id, 'assistant', assistantText, convId]
       );
 
       const mealPlan = parseRecipeJSON(assistantText);
@@ -396,14 +395,15 @@ app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) =>
 
     const client = await pool.connect();
     try {
+      await client.query('BEGIN');
       let totalEstimatedCost = 0;
 
-      const mealPlanResult = await client.query(
+      const mealPlanResult = await client.query<{ id: number }>(
         `INSERT INTO meal_plans (user_id, plan_name, total_estimated_cost, servings, status)
          VALUES ($1, $2, 0, $3, 'draft') RETURNING id`,
         [user_id, plan_name.trim(), servings]
       );
-      const mealPlanId = mealPlanResult.rows[0].id as number;
+      const mealPlanId = mealPlanResult.rows[0].id;
 
       for (const r of recipes) {
         const dayOfWeek = (r.day_of_week || 'Monday').toString().slice(0, 20);
@@ -420,12 +420,12 @@ app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) =>
 
         totalEstimatedCost += estimatedCost;
 
-        const recipeResult = await client.query(
+        const recipeResult = await client.query<{ id: number }>(
           `INSERT INTO recipes (meal_plan_id, day_of_week, meal_slot, title, instructions, prep_time, cook_time, estimated_cost, calories, protein, carbs, fat)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
           [mealPlanId, dayOfWeek, mealSlot, title, instructions, prepTime, cookTime, estimatedCost, calories, protein, carbs, fat]
         );
-        const recipeId = recipeResult.rows[0].id as number;
+        const recipeId = recipeResult.rows[0].id;
 
         const ingredients = Array.isArray(r.ingredients) ? r.ingredients : [];
         for (const ing of ingredients) {
@@ -448,6 +448,8 @@ app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) =>
         [totalEstimatedCost, mealPlanId]
       );
 
+      await client.query('COMMIT');
+
       res.status(201).json({
         meal_plan_id: mealPlanId,
         plan_name: plan_name.trim(),
@@ -455,6 +457,9 @@ app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) =>
         servings,
         recipes_count: recipes.length,
       });
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txErr;
     } finally {
       client.release();
     }
@@ -485,22 +490,15 @@ app.get('/shopping-list/:plan_id', authenticateToken, async (req: Request, res: 
         return res.status(404).json({ error: 'Meal plan not found' });
       }
 
-      let listResult = await client.query(
-        'SELECT id FROM shopping_lists WHERE meal_plan_id = $1',
+      const upsertResult = await client.query<{ id: number }>(
+        `INSERT INTO shopping_lists (meal_plan_id, total_cost)
+         VALUES ($1, 0)
+         ON CONFLICT (meal_plan_id) DO UPDATE SET meal_plan_id = EXCLUDED.meal_plan_id
+         RETURNING id`,
         [planId]
       );
-      let shoppingListId: number;
-
-      if (listResult.rows.length === 0) {
-        const insertResult = await client.query(
-          'INSERT INTO shopping_lists (meal_plan_id, total_cost) VALUES ($1, 0) RETURNING id',
-          [planId]
-        );
-        shoppingListId = insertResult.rows[0].id as number;
-      } else {
-        shoppingListId = listResult.rows[0].id as number;
-        await client.query('DELETE FROM shopping_list_items WHERE shopping_list_id = $1', [shoppingListId]);
-      }
+      const shoppingListId = upsertResult.rows[0].id;
+      await client.query('DELETE FROM shopping_list_items WHERE shopping_list_id = $1', [shoppingListId]);
 
       const aggResult = await client.query(
         `SELECT
@@ -569,9 +567,6 @@ app.get('/shopping-list/:plan_id', authenticateToken, async (req: Request, res: 
   }
 });
 
-const RETAILERS = ['tesco', 'sainsburys'] as const;
-type Retailer = (typeof RETAILERS)[number];
-
 function buildRetailerSearchUrl(retailer: Retailer, searchQuery: string): string {
   const encoded = encodeURIComponent(searchQuery.trim());
   const utmSource = process.env.UTM_SOURCE || 'my-food-sorted';
@@ -618,6 +613,6 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  log('INFO', `Server listening on port ${PORT}`);
+app.listen(config.PORT, '0.0.0.0', () => {
+  log('INFO', `Server listening on port ${config.PORT}`);
 });

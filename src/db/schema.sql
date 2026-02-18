@@ -29,6 +29,7 @@ CREATE TABLE chat_messages (
 
 CREATE INDEX idx_chat_messages_user_id ON chat_messages(user_id);
 CREATE INDEX idx_chat_messages_conversation_id ON chat_messages(conversation_id);
+CREATE INDEX idx_chat_messages_conversation_user ON chat_messages(conversation_id, user_id);
 CREATE INDEX idx_chat_messages_timestamp ON chat_messages(timestamp);
 
 -- Meal plans
@@ -80,10 +81,10 @@ CREATE TABLE ingredients (
 CREATE INDEX idx_ingredients_recipe_id ON ingredients(recipe_id);
 CREATE INDEX idx_ingredients_category ON ingredients(category);
 
--- Shopping lists (linked to meal plans)
+-- Shopping lists (linked to meal plans; one list per plan for ON CONFLICT upsert)
 CREATE TABLE shopping_lists (
   id SERIAL PRIMARY KEY,
-  meal_plan_id INT NOT NULL REFERENCES meal_plans(id) ON DELETE CASCADE,
+  meal_plan_id INT NOT NULL UNIQUE REFERENCES meal_plans(id) ON DELETE CASCADE,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   total_cost DECIMAL(10, 2)
 );
