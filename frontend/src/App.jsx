@@ -5,7 +5,7 @@ import ShoppingListDisplay from './components/ShoppingListDisplay'
 import LandingPage from './components/LandingPage'
 import './App.css'
 
-const API = import.meta.env.VITE_API_URL ?? ''
+const API = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '')
 
 export default function App() {
   /* ── Auth ── */
@@ -15,9 +15,10 @@ export default function App() {
   const [authPassword,   setAuthPassword]   = useState('')
 
   /* ── Chat ── */
-  const [messages,    setMessages]    = useState([])
-  const [input,       setInput]       = useState('')
-  const [chatLoading, setChatLoading] = useState(false)
+  const [messages,       setMessages]       = useState([])
+  const [input,          setInput]          = useState('')
+  const [chatLoading,    setChatLoading]    = useState(false)
+  const [conversationId]                    = useState(() => crypto.randomUUID())
 
   /* ── Meal plan ── */
   const [mealPlan,    setMealPlan]    = useState(null)
@@ -34,18 +35,18 @@ export default function App() {
   /* ── Auth ── */
   const handleAuth = useCallback(async (endpoint, email, password) => {
     try {
-      const res = await fetch(`${API}/auth/${endpoint}`, {
+      const res = await fetch(`${API}/${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       })
       const data = await res.json()
-      if (!res.ok) throw new Error(data.detail ?? 'Authentication failed')
+      if (!res.ok) throw new Error(data.error ?? 'Authentication failed')
 
-      localStorage.setItem('token',  data.access_token)
-      localStorage.setItem('userId', String(data.user_id))
-      setToken(data.access_token)
-      setLoggedInUserId(String(data.user_id))
+      localStorage.setItem('token',  data.token)
+      localStorage.setItem('userId', String(data.userId))
+      setToken(data.token)
+      setLoggedInUserId(String(data.userId))
       setAuthEmail('')
       setAuthPassword('')
     } catch (err) {
@@ -81,26 +82,26 @@ export default function App() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ message: text, conversation_history: messages }),
+        body: JSON.stringify({ user_message: text, conversation_id: conversationId }),
       })
       const data = await res.json()
-      if (!res.ok) throw new Error(data.detail ?? 'Chat error')
+      if (!res.ok) throw new Error(data.error ?? 'Chat error')
 
-      setMessages(prev => [...prev, { role: 'assistant', content: data.response }])
+      setMessages(prev => [...prev, { role: 'assistant', content: data.message }])
       if (data.meal_plan) setMealPlan(data.meal_plan)
     } catch (err) {
       setMessages(prev => [...prev, { role: 'assistant', content: `Error: ${err.message}` }])
     } finally {
       setChatLoading(false)
     }
-  }, [input, chatLoading, token, messages])
+  }, [input, chatLoading, token, messages, conversationId])
 
   /* ── Save plan ── */
   const savePlan = useCallback(async () => {
     if (!mealPlan || planLoading) return
     setPlanLoading(true)
     try {
-      const res = await fetch(`${API}/meal-plans`, {
+      const res = await fetch(`${API}/meal-plan`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -109,9 +110,9 @@ export default function App() {
         body: JSON.stringify(mealPlan),
       })
       const data = await res.json()
-      if (!res.ok) throw new Error(data.detail ?? 'Save failed')
-      setSavedPlanId(data.id)
-      alert(`Plan saved! ID: ${data.id}`)
+      if (!res.ok) throw new Error(data.error ?? 'Save failed')
+      setSavedPlanId(data.meal_plan_id)
+      alert(`Plan saved! ID: ${data.meal_plan_id}`)
     } catch (err) {
       alert(err.message)
     } finally {
@@ -124,12 +125,11 @@ export default function App() {
     if (!savedPlanId || shopLoading) return
     setShopLoading(true)
     try {
-      const res = await fetch(`${API}/shopping-lists/generate/${savedPlanId}`, {
-        method: 'POST',
+      const res = await fetch(`${API}/shopping-list/${savedPlanId}`, {
         headers: { Authorization: `Bearer ${token}` },
       })
       const data = await res.json()
-      if (!res.ok) throw new Error(data.detail ?? 'Generate failed')
+      if (!res.ok) throw new Error(data.error ?? 'Generate failed')
       setShoppingList(data)
     } catch (err) {
       alert(err.message)
@@ -142,13 +142,17 @@ export default function App() {
     if (!shoppingList || shopLoading) return
     setShopLoading(true)
     try {
-      const res = await fetch(`${API}/shopping-lists/${shoppingList.id}/shop?retailer=${retailer}`, {
+      const res = await fetch(`${API}/affiliate-link`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ retailer, search_query: 'weekly grocery shopping' }),
       })
       const data = await res.json()
-      if (!res.ok) throw new Error(data.detail ?? 'Shop failed')
-      if (data.shopping_url) window.open(data.shopping_url, '_blank', 'noopener,noreferrer')
+      if (!res.ok) throw new Error(data.error ?? 'Shop failed')
+      if (data.url) window.open(data.url, '_blank', 'noopener,noreferrer')
     } catch (err) {
       alert(err.message)
     } finally {
