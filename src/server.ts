@@ -7,6 +7,8 @@ import helmet from 'helmet';
 import { authenticateToken, AuthenticatedRequest } from './middleware/auth';
 import { Pool } from 'pg';
 import cors from 'cors';
+import * as fs from 'fs';
+import * as path from 'path';
 import { config, RETAILERS, type Retailer } from './config';
 
 // Config is validated at import (config.ts); server exits if JWT_SECRET or CLAUDE_API_KEY missing.
@@ -666,6 +668,24 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(config.PORT, '0.0.0.0', () => {
-  log('INFO', `Server listening on port ${config.PORT}`);
-});
+// ---------------------------------------------------------------------------
+// Startup: apply schema.sql (idempotent, IF NOT EXISTS) so a fresh database
+// gets its tables created automatically instead of needing a manual step.
+// ---------------------------------------------------------------------------
+
+async function applySchemaAndStart() {
+  try {
+    const schemaSql = fs.readFileSync(path.join(__dirname, 'db', 'schema.sql'), 'utf8');
+    await pool.query(schemaSql);
+    log('INFO', 'Database schema up to date');
+  } catch (err) {
+    log('ERROR', 'Failed to apply database schema', { err: err instanceof Error ? err.message : String(err) });
+    process.exit(1);
+  }
+
+  app.listen(config.PORT, '0.0.0.0', () => {
+    log('INFO', `Server listening on port ${config.PORT}`);
+  });
+}
+
+applySchemaAndStart();
