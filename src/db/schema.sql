@@ -2,7 +2,7 @@
 -- PostgreSQL - Production Ready
 
 -- Users
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,
   email VARCHAR(255) UNIQUE NOT NULL,
   password_hash VARCHAR(255) NOT NULL,
@@ -14,11 +14,11 @@ CREATE TABLE users (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_users_email ON users(email);
-CREATE INDEX idx_users_created_at ON users(created_at);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
 
 -- Chat messages
-CREATE TABLE chat_messages (
+CREATE TABLE IF NOT EXISTS chat_messages (
   id SERIAL PRIMARY KEY,
   user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   sender VARCHAR(50) NOT NULL,
@@ -27,13 +27,13 @@ CREATE TABLE chat_messages (
   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_chat_messages_user_id ON chat_messages(user_id);
-CREATE INDEX idx_chat_messages_conversation_id ON chat_messages(conversation_id);
-CREATE INDEX idx_chat_messages_conversation_user ON chat_messages(conversation_id, user_id);
-CREATE INDEX idx_chat_messages_timestamp ON chat_messages(timestamp);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_user_id ON chat_messages(user_id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_id ON chat_messages(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_user ON chat_messages(conversation_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_timestamp ON chat_messages(timestamp);
 
 -- Meal plans
-CREATE TABLE meal_plans (
+CREATE TABLE IF NOT EXISTS meal_plans (
   id SERIAL PRIMARY KEY,
   user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   plan_name VARCHAR(255),
@@ -43,12 +43,12 @@ CREATE TABLE meal_plans (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_meal_plans_user_id ON meal_plans(user_id);
-CREATE INDEX idx_meal_plans_status ON meal_plans(status);
-CREATE INDEX idx_meal_plans_created_at ON meal_plans(created_at);
+CREATE INDEX IF NOT EXISTS idx_meal_plans_user_id ON meal_plans(user_id);
+CREATE INDEX IF NOT EXISTS idx_meal_plans_status ON meal_plans(status);
+CREATE INDEX IF NOT EXISTS idx_meal_plans_created_at ON meal_plans(created_at);
 
 -- Recipes (linked to meal plans)
-CREATE TABLE recipes (
+CREATE TABLE IF NOT EXISTS recipes (
   id SERIAL PRIMARY KEY,
   meal_plan_id INT NOT NULL REFERENCES meal_plans(id) ON DELETE CASCADE,
   day_of_week VARCHAR(20) NOT NULL,
@@ -64,11 +64,11 @@ CREATE TABLE recipes (
   fat DECIMAL(10, 2)
 );
 
-CREATE INDEX idx_recipes_meal_plan_id ON recipes(meal_plan_id);
-CREATE INDEX idx_recipes_day_meal ON recipes(meal_plan_id, day_of_week, meal_slot);
+CREATE INDEX IF NOT EXISTS idx_recipes_meal_plan_id ON recipes(meal_plan_id);
+CREATE INDEX IF NOT EXISTS idx_recipes_day_meal ON recipes(meal_plan_id, day_of_week, meal_slot);
 
 -- Ingredients (linked to recipes)
-CREATE TABLE ingredients (
+CREATE TABLE IF NOT EXISTS ingredients (
   id SERIAL PRIMARY KEY,
   recipe_id INT NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
   ingredient_name VARCHAR(255) NOT NULL,
@@ -78,22 +78,22 @@ CREATE TABLE ingredients (
   estimated_price DECIMAL(10, 2)
 );
 
-CREATE INDEX idx_ingredients_recipe_id ON ingredients(recipe_id);
-CREATE INDEX idx_ingredients_category ON ingredients(category);
+CREATE INDEX IF NOT EXISTS idx_ingredients_recipe_id ON ingredients(recipe_id);
+CREATE INDEX IF NOT EXISTS idx_ingredients_category ON ingredients(category);
 
 -- Shopping lists (linked to meal plans; one list per plan for ON CONFLICT upsert)
-CREATE TABLE shopping_lists (
+CREATE TABLE IF NOT EXISTS shopping_lists (
   id SERIAL PRIMARY KEY,
   meal_plan_id INT NOT NULL UNIQUE REFERENCES meal_plans(id) ON DELETE CASCADE,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   total_cost DECIMAL(10, 2)
 );
 
-CREATE INDEX idx_shopping_lists_meal_plan_id ON shopping_lists(meal_plan_id);
-CREATE INDEX idx_shopping_lists_created_at ON shopping_lists(created_at);
+CREATE INDEX IF NOT EXISTS idx_shopping_lists_meal_plan_id ON shopping_lists(meal_plan_id);
+CREATE INDEX IF NOT EXISTS idx_shopping_lists_created_at ON shopping_lists(created_at);
 
 -- Shopping list items
-CREATE TABLE shopping_list_items (
+CREATE TABLE IF NOT EXISTS shopping_list_items (
   id SERIAL PRIMARY KEY,
   shopping_list_id INT NOT NULL REFERENCES shopping_lists(id) ON DELETE CASCADE,
   ingredient_name VARCHAR(255) NOT NULL,
@@ -104,5 +104,5 @@ CREATE TABLE shopping_list_items (
   checked BOOLEAN DEFAULT FALSE
 );
 
-CREATE INDEX idx_shopping_list_items_shopping_list_id ON shopping_list_items(shopping_list_id);
-CREATE INDEX idx_shopping_list_items_checked ON shopping_list_items(checked);
+CREATE INDEX IF NOT EXISTS idx_shopping_list_items_shopping_list_id ON shopping_list_items(shopping_list_id);
+CREATE INDEX IF NOT EXISTS idx_shopping_list_items_checked ON shopping_list_items(checked);
