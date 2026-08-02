@@ -75,6 +75,7 @@ Your responsibilities:
       }
     ]
   }
+- Ingredient naming and units must be consistent across every recipe in the same plan, since matching ingredients get combined into one shopping list line: use the same lowercase singular name for the same ingredient every time it appears (e.g. always "onion", not "onions" or "red onion" unless it's genuinely a different ingredient), and always use the same metric unit for a given ingredient (e.g. always grams, not a mix of "g" and "kg").
 - Be concise, friendly, and helpful. If the user's message doesn't require a meal plan, respond conversationally without JSON.`;
 
 interface ClaudeMessage {
@@ -546,15 +547,15 @@ app.get('/shopping-list/:plan_id', authenticateToken, async (req: Request, res: 
 
         const aggResult = await client.query(
           `SELECT
-             i.ingredient_name,
-             COALESCE(i.unit, '') AS unit,
+             MIN(i.ingredient_name) AS ingredient_name,
+             COALESCE(MIN(i.unit), '') AS unit,
              i.category,
              SUM(i.quantity) AS quantity,
              SUM(i.estimated_price) AS estimated_price
            FROM ingredients i
            JOIN recipes r ON r.id = i.recipe_id
            WHERE r.meal_plan_id = $1
-           GROUP BY i.ingredient_name, COALESCE(i.unit, ''), i.category`,
+           GROUP BY LOWER(TRIM(i.ingredient_name)), COALESCE(LOWER(TRIM(i.unit)), ''), i.category`,
           [planId]
         );
 
