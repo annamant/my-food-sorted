@@ -618,36 +618,34 @@ app.get('/shopping-list/:plan_id', authenticateToken, async (req: Request, res: 
   }
 });
 
-function buildRetailerSearchUrl(retailer: Retailer, searchQuery: string): string {
-  const encoded = encodeURIComponent(searchQuery.trim());
-  const utmSource = config.UTM_SOURCE;
+function buildRetailerUrl(retailer: Retailer): string {
+  const utmSource = encodeURIComponent(config.UTM_SOURCE);
 
   switch (retailer) {
     case 'tesco':
-      return `https://www.tesco.com/groceries/en-GB/search?query=${encoded}&utm_source=${encodeURIComponent(utmSource)}`;
+      return `https://www.tesco.com/groceries/en-GB/?utm_source=${utmSource}`;
     case 'sainsburys':
-      return `https://www.sainsburys.co.uk/gol-ui/SearchDisplayView?searchTerm=${encoded}&utm_source=${encodeURIComponent(utmSource)}`;
+      return `https://www.sainsburys.co.uk/gol-ui/groceries?utm_source=${utmSource}`;
     default:
       throw new Error(`Unknown retailer: ${retailer}`);
   }
 }
 
+// No product-level search: retailer search boxes only handle one term, and a whole
+// week's ingredient list doesn't map to a single query. This links to the retailer's
+// grocery homepage instead, so the customer shops normally with the affiliate
+// tracking tag attached while referring to the shopping list still on screen.
 app.post('/affiliate-link', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const { retailer, search_query } = req.body;
+    const { retailer } = req.body;
 
-    if (
-      typeof retailer !== 'string' ||
-      !RETAILERS.includes(retailer.toLowerCase() as Retailer) ||
-      typeof search_query !== 'string' ||
-      !search_query.trim()
-    ) {
+    if (typeof retailer !== 'string' || !RETAILERS.includes(retailer.toLowerCase() as Retailer)) {
       return res.status(400).json({
-        error: 'Invalid request. Required: retailer ("tesco" | "sainsburys"), search_query (non-empty string)',
+        error: 'Invalid request. Required: retailer ("tesco" | "sainsburys")',
       });
     }
 
-    const url = buildRetailerSearchUrl(retailer.toLowerCase() as Retailer, search_query);
+    const url = buildRetailerUrl(retailer.toLowerCase() as Retailer);
     res.json({ url });
   } catch (err) {
     log('ERROR', 'POST /affiliate-link failed', { err: String(err) });
