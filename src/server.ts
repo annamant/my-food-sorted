@@ -5,7 +5,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import { rateLimit } from 'express-rate-limit';
 import helmet from 'helmet';
 import { authenticateToken, AuthenticatedRequest } from './middleware/auth';
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import cors from 'cors';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -209,6 +209,128 @@ function messageWithoutJsonBlock(text: string): string {
   return out.replace(/\n{3,}/g, '\n\n').trim() || text;
 }
 
+interface UserPrefs {
+  dietary_preferences: string | null;
+  allergies: string | null;
+  household_size: number | null;
+  default_budget: number | null;
+  preferred_retailer: string | null;
+}
+
+function buildSystemPrompt(prefs: UserPrefs | null): string {
+  if (!prefs) return CLAUDE_MEAL_PLANNING_SYSTEM_PROMPT;
+
+  const lines: string[] = [];
+  if (prefs.dietary_preferences?.trim()) {
+    lines.push(`- Dietary preferences: ${prefs.dietary_preferences.trim()}`);
+  }
+  if (prefs.allergies?.trim()) {
+    lines.push(`- Allergies (must avoid): ${prefs.allergies.trim()}`);
+  }
+  if (prefs.household_size != null && prefs.household_size > 0) {
+    lines.push(`- Household size / servings: ${prefs.household_size}`);
+  }
+  if (prefs.default_budget != null && !Number.isNaN(Number(prefs.default_budget))) {
+    lines.push(`- Default weekly budget (GBP): £${Number(prefs.default_budget).toFixed(2)}`);
+  }
+  if (prefs.preferred_retailer?.trim()) {
+    lines.push(`- Preferred supermarket: ${prefs.preferred_retailer.trim()}`);
+  }
+
+  if (lines.length === 0) return CLAUDE_MEAL_PLANNING_SYSTEM_PROMPT;
+
+  return `${CLAUDE_MEAL_PLANNING_SYSTEM_PROMPT}
+
+Known preferences for this user (always respect these unless they override them in the conversation):
+${lines.join('\n')}`;
+}
+
+type ShoppingItemRow = {
+  id: number;
+  ingredient_name: string;
+  quantity: string | number | null;
+  unit: string | null;
+  category: string | null;
+  estimated_price: string | number | null;
+  checked: boolean;
+};
+
+function mapShoppingItems(rows: ShoppingItemRow[]) {
+  return rows.map((r) => ({
+    id: r.id,
+    ingredient_name: r.ingredient_name,
+    quantity: r.quantity != null ? parseFloat(String(r.quantity)) : null,
+    unit: r.unit,
+    category: r.category,
+    estimated_price: r.estimated_price != null ? parseFloat(String(r.estimated_price)) : null,
+    checked: Boolean(r.checked),
+  }));
+}
+
+async function generateShoppingListForPlan(
+  client: PoolClient,
+  planId: number
+): Promise<{ shoppingListId: number; totalCost: number }> {
+  const upsertResult = await client.query<{ id: number }>(
+    `INSERT INTO shopping_lists (meal_plan_id, total_cost)
+     VALUES ($1, 0)
+     ON CONFLICT (meal_plan_id) DO UPDATE SET meal_plan_id = EXCLUDED.meal_plan_id
+     RETURNING id`,
+    [planId]
+  );
+  const shoppingListId = upsertResult.rows[0].id;
+
+  // Preserve checked state across regenerate by ingredient+unit key
+  const prevChecked = await client.query<{
+    ingredient_name: string;
+    unit: string | null;
+    checked: boolean;
+  }>(
+    `SELECT ingredient_name, unit, checked FROM shopping_list_items WHERE shopping_list_id = $1`,
+    [shoppingListId]
+  );
+  const checkedMap = new Map<string, boolean>();
+  for (const row of prevChecked.rows) {
+    const key = `${(row.ingredient_name || '').toLowerCase().trim()}|${(row.unit || '').toLowerCase().trim()}`;
+    if (row.checked) checkedMap.set(key, true);
+  }
+
+  await client.query('DELETE FROM shopping_list_items WHERE shopping_list_id = $1', [shoppingListId]);
+
+  const aggResult = await client.query(
+    `SELECT
+       MIN(i.ingredient_name) AS ingredient_name,
+       COALESCE(MIN(i.unit), '') AS unit,
+       i.category,
+       SUM(i.quantity) AS quantity,
+       SUM(i.estimated_price) AS estimated_price
+     FROM ingredients i
+     JOIN recipes r ON r.id = i.recipe_id
+     WHERE r.meal_plan_id = $1
+     GROUP BY LOWER(TRIM(i.ingredient_name)), COALESCE(LOWER(TRIM(i.unit)), ''), i.category`,
+    [planId]
+  );
+
+  let totalCost = 0;
+  for (const row of aggResult.rows) {
+    const qty = row.quantity != null ? parseFloat(row.quantity) : null;
+    const price = row.estimated_price != null ? parseFloat(row.estimated_price) : null;
+    if (price != null) totalCost += price;
+    const unit = row.unit === '' ? null : row.unit;
+    const key = `${(row.ingredient_name || '').toLowerCase().trim()}|${(unit || '').toLowerCase().trim()}`;
+    const checked = checkedMap.get(key) === true;
+
+    await client.query(
+      `INSERT INTO shopping_list_items (shopping_list_id, ingredient_name, quantity, unit, category, estimated_price, checked)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [shoppingListId, row.ingredient_name, qty, unit, row.category, price, checked]
+    );
+  }
+
+  await client.query('UPDATE shopping_lists SET total_cost = $1 WHERE id = $2', [totalCost, shoppingListId]);
+  return { shoppingListId, totalCost };
+}
+
 // ---------------------------------------------------------------------------
 // Express App
 // ---------------------------------------------------------------------------
@@ -326,6 +448,121 @@ app.post('/login', authLimiter, async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
+// User preferences
+// ---------------------------------------------------------------------------
+
+app.get('/me', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const result = await pool.query(
+      `SELECT email, dietary_preferences, allergies, household_size, default_budget, preferred_retailer, message_count
+       FROM users WHERE id = $1`,
+      [user_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const u = result.rows[0];
+    res.json({
+      email: u.email,
+      dietary_preferences: u.dietary_preferences ?? '',
+      allergies: u.allergies ?? '',
+      household_size: u.household_size ?? 1,
+      default_budget: u.default_budget != null ? parseFloat(u.default_budget) : null,
+      preferred_retailer: u.preferred_retailer ?? 'tesco',
+      message_count: u.message_count ?? 0,
+      message_quota: config.MESSAGE_QUOTA_PER_USER,
+    });
+  } catch (err) {
+    log('ERROR', 'GET /me failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const {
+      dietary_preferences,
+      allergies,
+      household_size,
+      default_budget,
+      preferred_retailer,
+    } = req.body ?? {};
+
+    if (household_size !== undefined) {
+      if (typeof household_size !== 'number' || !Number.isInteger(household_size) || household_size < 1 || household_size > 20) {
+        return res.status(400).json({ error: 'household_size must be an integer between 1 and 20' });
+      }
+    }
+    if (default_budget !== undefined && default_budget !== null) {
+      if (typeof default_budget !== 'number' || Number.isNaN(default_budget) || default_budget < 0) {
+        return res.status(400).json({ error: 'default_budget must be a non-negative number or null' });
+      }
+    }
+    if (preferred_retailer !== undefined) {
+      if (typeof preferred_retailer !== 'string' || !RETAILERS.includes(preferred_retailer.toLowerCase() as Retailer)) {
+        return res.status(400).json({ error: 'preferred_retailer must be "tesco" or "sainsburys"' });
+      }
+    }
+    if (dietary_preferences !== undefined && typeof dietary_preferences !== 'string') {
+      return res.status(400).json({ error: 'dietary_preferences must be a string' });
+    }
+    if (allergies !== undefined && typeof allergies !== 'string') {
+      return res.status(400).json({ error: 'allergies must be a string' });
+    }
+
+    const result = await pool.query(
+      `UPDATE users SET
+         dietary_preferences = COALESCE($2, dietary_preferences),
+         allergies = COALESCE($3, allergies),
+         household_size = COALESCE($4, household_size),
+         default_budget = CASE WHEN $5::boolean THEN $6 ELSE default_budget END,
+         preferred_retailer = COALESCE($7, preferred_retailer)
+       WHERE id = $1
+       RETURNING email, dietary_preferences, allergies, household_size, default_budget, preferred_retailer, message_count`,
+      [
+        user_id,
+        dietary_preferences !== undefined ? String(dietary_preferences).slice(0, 2000) : null,
+        allergies !== undefined ? String(allergies).slice(0, 2000) : null,
+        household_size !== undefined ? household_size : null,
+        default_budget !== undefined,
+        default_budget === null ? null : default_budget,
+        preferred_retailer !== undefined ? preferred_retailer.toLowerCase() : null,
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const u = result.rows[0];
+    res.json({
+      email: u.email,
+      dietary_preferences: u.dietary_preferences ?? '',
+      allergies: u.allergies ?? '',
+      household_size: u.household_size ?? 1,
+      default_budget: u.default_budget != null ? parseFloat(u.default_budget) : null,
+      preferred_retailer: u.preferred_retailer ?? 'tesco',
+      message_count: u.message_count ?? 0,
+      message_quota: config.MESSAGE_QUOTA_PER_USER,
+    });
+  } catch (err) {
+    log('ERROR', 'PATCH /me failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Protected Routes
 // ---------------------------------------------------------------------------
 
@@ -374,6 +611,13 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
         convId,
       ]);
 
+      const prefsResult = await client.query<UserPrefs>(
+        `SELECT dietary_preferences, allergies, household_size, default_budget, preferred_retailer
+         FROM users WHERE id = $1`,
+        [user_id]
+      );
+      const prefs = prefsResult.rows[0] ?? null;
+
       const historyResult = await client.query(
         `SELECT sender, message_text FROM chat_messages 
          WHERE conversation_id = $1 AND user_id = $2 
@@ -386,7 +630,7 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
         content: row.message_text,
       }));
 
-      const assistantText = await callClaudeAPI(messages);
+      const assistantText = await callClaudeAPI(messages, buildSystemPrompt(prefs));
 
       await client.query(
         'INSERT INTO chat_messages (user_id, sender, message_text, conversation_id) VALUES ($1, $2, $3, $4)',
@@ -514,7 +758,193 @@ app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) =>
   }
 });
 
+app.get('/meal-plans', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const result = await pool.query(
+      `SELECT
+         mp.id,
+         mp.plan_name,
+         mp.total_estimated_cost,
+         mp.servings,
+         mp.status,
+         mp.created_at,
+         (SELECT COUNT(*)::int FROM recipes r WHERE r.meal_plan_id = mp.id) AS recipes_count
+       FROM meal_plans mp
+       WHERE mp.user_id = $1
+       ORDER BY mp.created_at DESC
+       LIMIT 50`,
+      [user_id]
+    );
+
+    res.json({
+      plans: result.rows.map((r) => ({
+        id: r.id,
+        plan_name: r.plan_name,
+        total_estimated_cost: r.total_estimated_cost != null ? parseFloat(r.total_estimated_cost) : null,
+        servings: r.servings,
+        status: r.status,
+        created_at: r.created_at,
+        recipes_count: r.recipes_count,
+      })),
+    });
+  } catch (err) {
+    log('ERROR', 'GET /meal-plans failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/meal-plan/:id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const planId = parseInt(req.params.id, 10);
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (isNaN(planId) || planId < 1) {
+      return res.status(400).json({ error: 'Invalid plan id.' });
+    }
+    if (user_id == null) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      const planResult = await client.query(
+        `SELECT id, plan_name, total_estimated_cost, servings, status, created_at
+         FROM meal_plans WHERE id = $1 AND user_id = $2`,
+        [planId, user_id]
+      );
+      if (planResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Meal plan not found' });
+      }
+      const plan = planResult.rows[0];
+
+      const recipesResult = await client.query(
+        `SELECT id, day_of_week, meal_slot, title, instructions, prep_time, cook_time,
+                estimated_cost, calories, protein, carbs, fat
+         FROM recipes WHERE meal_plan_id = $1
+         ORDER BY id ASC`,
+        [planId]
+      );
+
+      const recipes = [];
+      for (const recipe of recipesResult.rows) {
+        const ingredientsResult = await client.query(
+          `SELECT ingredient_name, quantity, unit, category, estimated_price
+           FROM ingredients WHERE recipe_id = $1 ORDER BY id ASC`,
+          [recipe.id]
+        );
+        recipes.push({
+          id: recipe.id,
+          day_of_week: recipe.day_of_week,
+          meal_slot: recipe.meal_slot,
+          title: recipe.title,
+          instructions: recipe.instructions,
+          prep_time: recipe.prep_time,
+          cook_time: recipe.cook_time,
+          estimated_cost: recipe.estimated_cost != null ? parseFloat(recipe.estimated_cost) : null,
+          calories: recipe.calories,
+          protein: recipe.protein != null ? parseFloat(recipe.protein) : null,
+          carbs: recipe.carbs != null ? parseFloat(recipe.carbs) : null,
+          fat: recipe.fat != null ? parseFloat(recipe.fat) : null,
+          ingredients: ingredientsResult.rows.map((ing) => ({
+            ingredient_name: ing.ingredient_name,
+            quantity: ing.quantity != null ? parseFloat(ing.quantity) : null,
+            unit: ing.unit,
+            category: ing.category,
+            estimated_price: ing.estimated_price != null ? parseFloat(ing.estimated_price) : null,
+          })),
+        });
+      }
+
+      res.json({
+        id: plan.id,
+        plan_name: plan.plan_name,
+        total_estimated_cost: plan.total_estimated_cost != null ? parseFloat(plan.total_estimated_cost) : null,
+        servings: plan.servings,
+        status: plan.status,
+        created_at: plan.created_at,
+        recipes,
+      });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'GET /meal-plan/:id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.get('/shopping-list/:plan_id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const planId = parseInt(req.params.plan_id, 10);
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (isNaN(planId) || planId < 1) {
+      return res.status(400).json({ error: 'Invalid plan_id. Must be a positive integer.' });
+    }
+    if (user_id == null) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      const planResult = await client.query(
+        'SELECT id FROM meal_plans WHERE id = $1 AND user_id = $2',
+        [planId, user_id]
+      );
+      if (planResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Meal plan not found' });
+      }
+
+      const listResult = await client.query<{ id: number; total_cost: string | null }>(
+        'SELECT id, total_cost FROM shopping_lists WHERE meal_plan_id = $1',
+        [planId]
+      );
+
+      let shoppingListId: number;
+      let totalCost: number;
+
+      if (listResult.rows.length === 0) {
+        await client.query('BEGIN');
+        try {
+          const generated = await generateShoppingListForPlan(client, planId);
+          shoppingListId = generated.shoppingListId;
+          totalCost = generated.totalCost;
+          await client.query('COMMIT');
+        } catch (txErr) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw txErr;
+        }
+      } else {
+        shoppingListId = listResult.rows[0].id;
+        totalCost = listResult.rows[0].total_cost != null ? parseFloat(listResult.rows[0].total_cost) : 0;
+      }
+
+      const itemsResult = await client.query<ShoppingItemRow>(
+        `SELECT id, ingredient_name, quantity, unit, category, estimated_price, checked
+         FROM shopping_list_items WHERE shopping_list_id = $1
+         ORDER BY category NULLS LAST, ingredient_name`,
+        [shoppingListId]
+      );
+
+      res.json({
+        shopping_list_id: shoppingListId,
+        plan_id: planId,
+        items: mapShoppingItems(itemsResult.rows),
+        total_cost: totalCost,
+      });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'GET /shopping-list/:plan_id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/shopping-list/:plan_id/generate', authenticateToken, async (req: Request, res: Response) => {
   try {
     const planId = parseInt(req.params.plan_id, 10);
     const user_id = (req as AuthenticatedRequest).user?.userId;
@@ -537,74 +967,20 @@ app.get('/shopping-list/:plan_id', authenticateToken, async (req: Request, res: 
 
       await client.query('BEGIN');
       try {
-        const upsertResult = await client.query<{ id: number }>(
-          `INSERT INTO shopping_lists (meal_plan_id, total_cost)
-           VALUES ($1, 0)
-           ON CONFLICT (meal_plan_id) DO UPDATE SET meal_plan_id = EXCLUDED.meal_plan_id
-           RETURNING id`,
-          [planId]
-        );
-        const shoppingListId = upsertResult.rows[0].id;
-        await client.query('DELETE FROM shopping_list_items WHERE shopping_list_id = $1', [shoppingListId]);
-
-        const aggResult = await client.query(
-          `SELECT
-             MIN(i.ingredient_name) AS ingredient_name,
-             COALESCE(MIN(i.unit), '') AS unit,
-             i.category,
-             SUM(i.quantity) AS quantity,
-             SUM(i.estimated_price) AS estimated_price
-           FROM ingredients i
-           JOIN recipes r ON r.id = i.recipe_id
-           WHERE r.meal_plan_id = $1
-           GROUP BY LOWER(TRIM(i.ingredient_name)), COALESCE(LOWER(TRIM(i.unit)), ''), i.category`,
-          [planId]
-        );
-
-        let totalCost = 0;
-        for (const row of aggResult.rows) {
-          const qty = row.quantity != null ? parseFloat(row.quantity) : null;
-          const price = row.estimated_price != null ? parseFloat(row.estimated_price) : null;
-          if (price != null) totalCost += price;
-
-          await client.query(
-            `INSERT INTO shopping_list_items (shopping_list_id, ingredient_name, quantity, unit, category, estimated_price, checked)
-             VALUES ($1, $2, $3, $4, $5, $6, FALSE)`,
-            [
-              shoppingListId,
-              row.ingredient_name,
-              qty,
-              row.unit === '' ? null : row.unit,
-              row.category,
-              price,
-            ]
-          );
-        }
-
-        await client.query(
-          'UPDATE shopping_lists SET total_cost = $1 WHERE id = $2',
-          [totalCost, shoppingListId]
-        );
-
+        const { shoppingListId, totalCost } = await generateShoppingListForPlan(client, planId);
         await client.query('COMMIT');
 
-        const itemsResult = await client.query(
-          `SELECT ingredient_name, quantity, unit, category, estimated_price, checked
-           FROM shopping_list_items WHERE shopping_list_id = $1 ORDER BY category NULLS LAST, ingredient_name`,
+        const itemsResult = await client.query<ShoppingItemRow>(
+          `SELECT id, ingredient_name, quantity, unit, category, estimated_price, checked
+           FROM shopping_list_items WHERE shopping_list_id = $1
+           ORDER BY category NULLS LAST, ingredient_name`,
           [shoppingListId]
         );
 
         res.json({
           shopping_list_id: shoppingListId,
           plan_id: planId,
-          items: itemsResult.rows.map((r) => ({
-            ingredient_name: r.ingredient_name,
-            quantity: r.quantity,
-            unit: r.unit,
-            category: r.category,
-            estimated_price: r.estimated_price,
-            checked: r.checked,
-          })),
+          items: mapShoppingItems(itemsResult.rows),
           total_cost: totalCost,
         });
       } catch (txErr) {
@@ -615,7 +991,103 @@ app.get('/shopping-list/:plan_id', authenticateToken, async (req: Request, res: 
       client.release();
     }
   } catch (err) {
-    log('ERROR', 'GET /shopping-list/:plan_id failed', { err: String(err) });
+    log('ERROR', 'POST /shopping-list/:plan_id/generate failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.patch('/shopping-list/items/:id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const itemId = parseInt(req.params.id, 10);
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const { checked } = req.body ?? {};
+
+    if (isNaN(itemId) || itemId < 1) {
+      return res.status(400).json({ error: 'Invalid item id.' });
+    }
+    if (user_id == null) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+    if (typeof checked !== 'boolean') {
+      return res.status(400).json({ error: 'checked must be a boolean' });
+    }
+
+    const result = await pool.query(
+      `UPDATE shopping_list_items sli
+       SET checked = $1
+       FROM shopping_lists sl
+       JOIN meal_plans mp ON mp.id = sl.meal_plan_id
+       WHERE sli.id = $2
+         AND sli.shopping_list_id = sl.id
+         AND mp.user_id = $3
+       RETURNING sli.id, sli.checked`,
+      [checked, itemId, user_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Shopping list item not found' });
+    }
+
+    res.json({ id: result.rows[0].id, checked: result.rows[0].checked });
+  } catch (err) {
+    log('ERROR', 'PATCH /shopping-list/items/:id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/shopping-list/:plan_id/clear-checks', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const planId = parseInt(req.params.plan_id, 10);
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (isNaN(planId) || planId < 1) {
+      return res.status(400).json({ error: 'Invalid plan_id. Must be a positive integer.' });
+    }
+    if (user_id == null) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      const planResult = await client.query(
+        'SELECT id FROM meal_plans WHERE id = $1 AND user_id = $2',
+        [planId, user_id]
+      );
+      if (planResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Meal plan not found' });
+      }
+
+      const listResult = await client.query<{ id: number; total_cost: string | null }>(
+        'SELECT id, total_cost FROM shopping_lists WHERE meal_plan_id = $1',
+        [planId]
+      );
+      if (listResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Shopping list not found' });
+      }
+
+      const shoppingListId = listResult.rows[0].id;
+      await client.query(
+        'UPDATE shopping_list_items SET checked = FALSE WHERE shopping_list_id = $1',
+        [shoppingListId]
+      );
+
+      const itemsResult = await client.query<ShoppingItemRow>(
+        `SELECT id, ingredient_name, quantity, unit, category, estimated_price, checked
+         FROM shopping_list_items WHERE shopping_list_id = $1
+         ORDER BY category NULLS LAST, ingredient_name`,
+        [shoppingListId]
+      );
+
+      res.json({
+        shopping_list_id: shoppingListId,
+        plan_id: planId,
+        items: mapShoppingItems(itemsResult.rows),
+        total_cost: listResult.rows[0].total_cost != null ? parseFloat(listResult.rows[0].total_cost) : 0,
+      });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /shopping-list/:plan_id/clear-checks failed', { err: String(err) });
     res.status(500).json({ error: 'Internal server error' });
   }
 });

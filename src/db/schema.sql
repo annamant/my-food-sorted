@@ -10,9 +10,13 @@ CREATE TABLE IF NOT EXISTS users (
   allergies TEXT,
   household_size INT DEFAULT 1,
   default_budget DECIMAL(10, 2),
+  preferred_retailer VARCHAR(50) DEFAULT 'tesco',
   message_count INT DEFAULT 0,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Existing databases: add preferred_retailer if missing
+ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_retailer VARCHAR(50) DEFAULT 'tesco';
 
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
