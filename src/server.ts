@@ -11,7 +11,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { config, RETAILERS, type Retailer } from './config';
 
-// Config is validated at import (config.ts); server exits if JWT_SECRET or CLAUDE_API_KEY missing.
+// Config is validated at import (config.ts); server exits if JWT_SECRET or OPENAI_API_KEY missing.
 
 // ---------------------------------------------------------------------------
 // Database Connection Pool
@@ -39,10 +39,10 @@ function log(level: string, msg: string, meta?: Record<string, unknown>) {
 }
 
 // ---------------------------------------------------------------------------
-// Claude API Integration
+// OpenAI API Integration
 // ---------------------------------------------------------------------------
 
-const CLAUDE_MEAL_PLANNING_SYSTEM_PROMPT = `You are My Food SORTED, an AI assistant that helps users plan meals, manage budgets, and generate shopping lists.
+const MEAL_PLANNING_SYSTEM_PROMPT = `You are My Food SORTED, an AI assistant that helps users plan meals, manage budgets, and generate shopping lists.
 
 Your responsibilities:
 - Create practical, budget-conscious meal plans based on user preferences, dietary requirements, and allergies
@@ -80,46 +80,47 @@ Your responsibilities:
 - Ingredient naming and units must be consistent across every recipe in the same plan, since matching ingredients get combined into one shopping list line: use the same lowercase singular name for the same ingredient every time it appears (e.g. always "onion", not "onions" or "red onion" unless it's genuinely a different ingredient), and always use the same metric unit for a given ingredient (e.g. always grams, not a mix of "g" and "kg").
 - Be concise, friendly, and helpful. If the user's message doesn't require a meal plan, respond conversationally without JSON.`;
 
-interface ClaudeMessage {
+interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
 }
 
-interface ClaudeResponse {
-  content: Array<{ type: string; text?: string }>;
-  stop_reason?: string;
+interface OpenAIChatResponse {
+  choices?: Array<{
+    message?: { role?: string; content?: string | null };
+  }>;
 }
 
-async function callClaudeAPI(
-  messages: ClaudeMessage[],
-  systemPrompt: string = CLAUDE_MEAL_PLANNING_SYSTEM_PROMPT
+async function callMealPlanningAPI(
+  messages: ChatMessage[],
+  systemPrompt: string = MEAL_PLANNING_SYSTEM_PROMPT
 ): Promise<string> {
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': config.CLAUDE_API_KEY,
-      'anthropic-version': '2023-06-01',
+      Authorization: `Bearer ${config.OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
-      model: config.CLAUDE_MODEL,
-      max_tokens: config.CLAUDE_MAX_TOKENS,
-      system: systemPrompt,
-      messages: messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
+      model: config.OPENAI_MODEL,
+      max_tokens: config.OPENAI_MAX_TOKENS,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...messages.map((m) => ({
+          role: m.role,
+          content: m.content,
+        })),
+      ],
     }),
   });
 
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(`Claude API error ${response.status}: ${errText}`);
+    throw new Error(`OpenAI API error ${response.status}: ${errText}`);
   }
 
-  const data = (await response.json()) as ClaudeResponse;
-  const textContent = data.content?.find((c) => c.type === 'text');
-  return textContent?.text ?? '';
+  const data = (await response.json()) as OpenAIChatResponse;
+  return data.choices?.[0]?.message?.content ?? '';
 }
 
 interface ParsedMealPlan {
@@ -218,7 +219,7 @@ interface UserPrefs {
 }
 
 function buildSystemPrompt(prefs: UserPrefs | null): string {
-  if (!prefs) return CLAUDE_MEAL_PLANNING_SYSTEM_PROMPT;
+  if (!prefs) return MEAL_PLANNING_SYSTEM_PROMPT;
 
   const lines: string[] = [];
   if (prefs.dietary_preferences?.trim()) {
@@ -237,9 +238,9 @@ function buildSystemPrompt(prefs: UserPrefs | null): string {
     lines.push(`- Preferred supermarket: ${prefs.preferred_retailer.trim()}`);
   }
 
-  if (lines.length === 0) return CLAUDE_MEAL_PLANNING_SYSTEM_PROMPT;
+  if (lines.length === 0) return MEAL_PLANNING_SYSTEM_PROMPT;
 
-  return `${CLAUDE_MEAL_PLANNING_SYSTEM_PROMPT}
+  return `${MEAL_PLANNING_SYSTEM_PROMPT}
 
 Known preferences for this user (always respect these unless they override them in the conversation):
 ${lines.join('\n')}`;
@@ -625,12 +626,12 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
         [convId, user_id]
       );
 
-      const messages: ClaudeMessage[] = historyResult.rows.map((row: { sender: string; message_text: string }) => ({
+      const messages: ChatMessage[] = historyResult.rows.map((row: { sender: string; message_text: string }) => ({
         role: row.sender === 'user' ? 'user' : 'assistant',
         content: row.message_text,
       }));
 
-      const assistantText = await callClaudeAPI(messages, buildSystemPrompt(prefs));
+      const assistantText = await callMealPlanningAPI(messages, buildSystemPrompt(prefs));
 
       await client.query(
         'INSERT INTO chat_messages (user_id, sender, message_text, conversation_id) VALUES ($1, $2, $3, $4)',

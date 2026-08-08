@@ -20,7 +20,8 @@ export const config = {
   PORT: parseInt(optionalEnv('PORT', '3000'), 10),
   DATABASE_URL: requireEnv('DATABASE_URL'),
   JWT_SECRET: requireEnv('JWT_SECRET'),
-  CLAUDE_API_KEY: requireEnv('CLAUDE_API_KEY'),
+  /** OpenAI API key (preferred — cheaper models). */
+  OPENAI_API_KEY: requireEnv('OPENAI_API_KEY'),
 
   /** Allowed CORS origins (comma-separated). Empty or * = allow all (dev only). */
   CORS_ORIGINS: optionalEnv('CORS_ORIGINS', ''),
@@ -31,9 +32,9 @@ export const config = {
   /** Message limit per user before 429 (reset not implemented; consider daily reset later). */
   MESSAGE_QUOTA_PER_USER: parseInt(optionalEnv('MESSAGE_QUOTA_PER_USER', '10'), 10),
 
-  /** Claude model and max tokens (for clarity; override via env if needed later). */
-  CLAUDE_MODEL: optionalEnv('CLAUDE_MODEL', 'claude-sonnet-4-5-20250929'),
-  CLAUDE_MAX_TOKENS: parseInt(optionalEnv('CLAUDE_MAX_TOKENS', '4096'), 10),
+  /** OpenAI model and max tokens. */
+  OPENAI_MODEL: optionalEnv('OPENAI_MODEL', 'gpt-4o-mini'),
+  OPENAI_MAX_TOKENS: parseInt(optionalEnv('OPENAI_MAX_TOKENS', '4096'), 10),
 
   /** UTM source tag appended to retailer affiliate links. */
   UTM_SOURCE: optionalEnv('UTM_SOURCE', 'my-food-sorted'),
