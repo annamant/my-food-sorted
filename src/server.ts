@@ -44,22 +44,22 @@ function log(level: string, msg: string, meta?: Record<string, unknown>) {
 
 const MEAL_PLANNING_SYSTEM_PROMPT = `You are the My Food SORTED chef — a friendly UK home-cooking coach.
 
-YOUR CONVERSATION STYLE (important):
-- Do NOT jump straight into a full meal plan.
-- First gather what you need with a short, easy intake — usually 1–2 short messages, not an interrogation.
-- NEVER ask a long numbered questionnaire (1–5). People find that hard to answer.
-- Ask in natural chat: one short paragraph with at most 2–3 plain questions, or ask the most important missing thing first and follow up later.
-- Good topics (only if still unknown): people/days; budget; allergies/dislikes; proteins they want; pantry staples; max cook time; cuisine mood.
-- Skip anything already answered (profile or earlier messages).
-- After you have enough to cook well, deliver the plan. If still missing one critical detail, ask ONE short follow-up — then plan.
-- This paced intake improves fit and reduces one-shot overuse.
+STRUCTURED MEAL BRIEF:
+- The app often sends a structured meal brief (people, days, meals, cuisines, cooking methods, proteins, pantry, avoid list, cook-time cap, budget).
+- Treat that brief as already answered. Do NOT re-ask those topics.
+- Only ask about genuine gaps, in natural chat — never a numbered 1–5 questionnaire.
+- At most one short follow-up if something critical is missing; otherwise go ahead and plan.
 
-WHEN YOU FINALLY DELIVER A PLAN:
-- Give a short friendly summary (2–4 sentences), then a fenced JSON block the app can save:
+CONVERSATION STYLE:
+- Prefer using the brief + a short free-text message from the user.
+- Keep chat light: confirm understanding in 1–2 sentences, then deliver the plan when you can.
+
+WHEN YOU DELIVER A PLAN:
+- Short friendly summary (2–4 sentences), then a fenced JSON block the app can save:
 \`\`\`json
 { ... }
 \`\`\`
-- You MUST include the real JSON object (not just a summary). Without JSON the app cannot save the plan.
+- You MUST include the real JSON object (not just a summary).
 - JSON schema (required):
   {
     "plan_name": "string",
@@ -89,14 +89,46 @@ WHEN YOU FINALLY DELIVER A PLAN:
       }
     ]
   }
-- Variety matters: do NOT give two similar dishes on the same day (e.g. chicken stir-fry brunch + beef stir-fry dinner). Vary method, cuisine, and main ingredient across meals in the same day/plan.
-- If they asked for light brunch + dinner, make brunch genuinely lighter and different in style from dinner.
-- Respect dislikes, allergies, no-garlic, cook-time caps, and pantry items they mentioned.
-- Use their cuisine preferences with real variety across the plan (don't default everything to one stir-fry template).
-- Costs / estimated_price in realistic UK GBP.
-- Ingredient names/units must stay consistent across the plan (lowercase singular; same metric unit for the same ingredient).
-- During the questioning phase: conversational only — NO JSON.
-- Pure chit-chat unrelated to food: be brief and friendly, no JSON.`;
+- Respect the brief strictly: cuisines, cooking methods, proteins, pantry, avoid list, max cook time, budget, meal slots.
+- Variety: do NOT serve two similar dishes the same day (e.g. chicken stir-fry + beef stir-fry). Vary method/cuisine across meals.
+- If brunch + dinner: brunch should be lighter and stylistically different from dinner.
+- Costs in realistic UK GBP. Consistent ingredient naming/units across the plan.
+- Pure chit-chat with no food ask: brief and friendly, no JSON.`;
+
+function formatMealBrief(brief: Record<string, unknown> | null | undefined): string {
+  if (!brief || typeof brief !== 'object') return '';
+  const lines: string[] = [];
+  const num = (v: unknown) => (typeof v === 'number' && !Number.isNaN(v) ? v : null);
+  const list = (v: unknown) => (Array.isArray(v) ? v.map(String).filter(Boolean) : []);
+  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+
+  const servings = num(brief.servings);
+  const days = num(brief.days);
+  const budget = num(brief.budget_per_day);
+  const cook = num(brief.max_cook_minutes);
+  const slots = list(brief.meal_slots);
+  const cuisines = list(brief.cuisines);
+  const methods = list(brief.cooking_methods);
+  const proteins = list(brief.proteins);
+  const pantry = list(brief.pantry);
+  const avoid = str(brief.avoid);
+  const notes = str(brief.notes);
+
+  if (servings != null) lines.push(`- People / servings: ${servings}`);
+  if (days != null) lines.push(`- Days to cover: ${days}`);
+  if (slots.length) lines.push(`- Meals needed: ${slots.join(', ')}`);
+  if (budget != null) lines.push(`- Budget per day (GBP): £${budget}`);
+  if (cook != null) lines.push(`- Max cook time per meal: ${cook} minutes`);
+  if (cuisines.length) lines.push(`- Preferred cuisines: ${cuisines.join(', ')}`);
+  if (methods.length) lines.push(`- Preferred cooking methods: ${methods.join(', ')}`);
+  if (proteins.length) lines.push(`- Proteins to use: ${proteins.join(', ')}`);
+  if (pantry.length) lines.push(`- Pantry / already have: ${pantry.join(', ')}`);
+  if (avoid) lines.push(`- Avoid / dislikes: ${avoid}`);
+  if (notes) lines.push(`- Extra notes: ${notes}`);
+
+  if (!lines.length) return '';
+  return `Structured meal brief from the app UI (treat as already answered — do not re-ask):\n${lines.join('\n')}`;
+}
 
 interface ChatMessage {
   role: 'user' | 'assistant';
@@ -236,8 +268,15 @@ interface UserPrefs {
   preferred_retailer: string | null;
 }
 
-function buildSystemPrompt(prefs: UserPrefs | null): string {
-  if (!prefs) return MEAL_PLANNING_SYSTEM_PROMPT;
+function buildSystemPrompt(prefs: UserPrefs | null, mealBrief?: Record<string, unknown> | null): string {
+  let prompt = MEAL_PLANNING_SYSTEM_PROMPT;
+
+  const briefBlock = formatMealBrief(mealBrief);
+  if (briefBlock) {
+    prompt += `\n\n${briefBlock}`;
+  }
+
+  if (!prefs) return prompt;
 
   const lines: string[] = [];
   if (prefs.dietary_preferences?.trim()) {
@@ -256,11 +295,11 @@ function buildSystemPrompt(prefs: UserPrefs | null): string {
     lines.push(`- Preferred supermarket: ${prefs.preferred_retailer.trim()}`);
   }
 
-  if (lines.length === 0) return MEAL_PLANNING_SYSTEM_PROMPT;
+  if (lines.length === 0) return prompt;
 
-  return `${MEAL_PLANNING_SYSTEM_PROMPT}
+  return `${prompt}
 
-Known preferences for this user (already saved — do not re-ask unless they want to change them; still ask about pantry items, dislikes, and anything missing):
+Known account preferences (already saved — do not re-ask unless they want to change them):
 ${lines.join('\n')}`;
 }
 
@@ -587,7 +626,7 @@ app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
 
 app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const { user_message, conversation_id } = req.body;
+    const { user_message, conversation_id, meal_brief } = req.body;
     const user_id = (req as AuthenticatedRequest).user?.userId;
 
     if (
@@ -607,6 +646,11 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
         error: 'conversation_id must be 1–100 characters, alphanumeric, hyphen, or underscore only.',
       });
     }
+
+    const brief =
+      meal_brief && typeof meal_brief === 'object' && !Array.isArray(meal_brief)
+        ? (meal_brief as Record<string, unknown>)
+        : null;
 
     const client = await pool.connect();
 
@@ -649,7 +693,7 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
         content: row.message_text,
       }));
 
-      const assistantText = await callMealPlanningAPI(messages, buildSystemPrompt(prefs));
+      const assistantText = await callMealPlanningAPI(messages, buildSystemPrompt(prefs, brief));
 
       await client.query(
         'INSERT INTO chat_messages (user_id, sender, message_text, conversation_id) VALUES ($1, $2, $3, $4)',
