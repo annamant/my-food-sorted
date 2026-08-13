@@ -30,7 +30,7 @@ export const config = {
   JSON_BODY_LIMIT: optionalEnv('JSON_BODY_LIMIT', '50kb'),
 
   /** Message limit per user before 429 (reset not implemented; consider daily reset later). */
-  MESSAGE_QUOTA_PER_USER: parseInt(optionalEnv('MESSAGE_QUOTA_PER_USER', '10'), 10),
+  MESSAGE_QUOTA_PER_USER: parseInt(optionalEnv('MESSAGE_QUOTA_PER_USER', '50'), 10),
 
   /** OpenAI model and max tokens. */
   OPENAI_MODEL: optionalEnv('OPENAI_MODEL', 'gpt-4o-mini'),

@@ -36,7 +36,7 @@ CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_id ON chat_messages(co
 CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_user ON chat_messages(conversation_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_timestamp ON chat_messages(timestamp);
 
--- Meal plans
+-- Meal plans (library entries — single recipes or weekly playlists)
 CREATE TABLE IF NOT EXISTS meal_plans (
   id SERIAL PRIMARY KEY,
   user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -44,12 +44,22 @@ CREATE TABLE IF NOT EXISTS meal_plans (
   total_estimated_cost DECIMAL(10, 2),
   servings INT,
   status VARCHAR(50) DEFAULT 'draft',
+  is_public BOOLEAN NOT NULL DEFAULT FALSE,
+  share_slug VARCHAR(32) UNIQUE,
+  shared_at TIMESTAMP,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_meal_plans_user_id ON meal_plans(user_id);
 CREATE INDEX IF NOT EXISTS idx_meal_plans_status ON meal_plans(status);
 CREATE INDEX IF NOT EXISTS idx_meal_plans_created_at ON meal_plans(created_at);
+CREATE INDEX IF NOT EXISTS idx_meal_plans_share_slug ON meal_plans(share_slug) WHERE share_slug IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_meal_plans_is_public ON meal_plans(is_public) WHERE is_public = TRUE;
+
+-- Existing databases: add share columns if missing
+ALTER TABLE meal_plans ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE meal_plans ADD COLUMN IF NOT EXISTS share_slug VARCHAR(32) UNIQUE;
+ALTER TABLE meal_plans ADD COLUMN IF NOT EXISTS shared_at TIMESTAMP;
 
 -- Recipes (linked to meal plans)
 CREATE TABLE IF NOT EXISTS recipes (

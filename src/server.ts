@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import express, { Request, Response, NextFunction } from 'express';
 import { rateLimit } from 'express-rate-limit';
 import helmet from 'helmet';
@@ -42,17 +43,28 @@ function log(level: string, msg: string, meta?: Record<string, unknown>) {
 // OpenAI API Integration
 // ---------------------------------------------------------------------------
 
-const MEAL_PLANNING_SYSTEM_PROMPT = `You are the My Food SORTED chef — a friendly UK home-cooking coach.
+const MEAL_PLANNING_SYSTEM_PROMPT = `You are the My Food SORTED kitchen — a UK home-cooking coach for a personal recipe library (think Spotify for food: get classics, remix them, cook from what's in, save what you love).
 
-STRUCTURED MEAL BRIEF:
-- The app often sends a structured meal brief (people, days, meals, cuisines, cooking methods, proteins, pantry, avoid list, cook-time cap, budget).
-- Treat that brief as already answered. Do NOT re-ask those topics.
+STRUCTURED MEAL BRIEF (HARD CONSTRAINTS — NON-NEGOTIABLE):
+- The app often sends a structured meal brief (people, days, meals, cuisines, cooking methods, proteins, pantry, avoid list, cook-time cap, budget, notes).
+- When a brief is present, you MUST obey it completely. Do not invent conflicting choices.
+- Proteins listed: use those proteins as the main protein(s). Do not switch to chicken/fish/veg if they asked for beef (etc.).
+- Meal slots listed: only create those meal types. If only "dinner" is listed, do NOT add brunch/lunch/breakfast.
+- Avoid / dislikes: never include those ingredients (e.g. no garlic means zero garlic in ingredients or method).
+- Extra notes: treat as required preferences (e.g. "lots of onions" means the dish should feature onions generously).
+- Pantry items: prefer using them; do not ignore them when the user is cooking from the cupboard.
+- Budget, cook-time, servings, days, cuisines, methods: respect them.
+- Treat the brief as already answered. Do NOT re-ask those topics.
 - Only ask about genuine gaps, in natural chat — never a numbered 1–5 questionnaire.
 - At most one short follow-up if something critical is missing; otherwise go ahead and plan.
 
 CONVERSATION STYLE:
 - Prefer using the brief + a short free-text message from the user.
-- Keep chat light: confirm understanding in 1–2 sentences, then deliver the plan when you can.
+- Keep chat light: in 1–2 sentences, explicitly confirm the key brief choices you followed (e.g. "Beef dinner, no garlic, plenty of onion"), then deliver the plan.
+- Classics: if they ask for a known dish (e.g. carbonara), adapt it to the brief (protein swaps, avoid list, notes) rather than ignoring the brief for authenticity.
+- Remix requests: when they ask to cut calories, cost, swap ingredients, or adapt for diet — rewrite the dish and deliver a full new JSON plan, still obeying the brief.
+- Pantry-first: if they list ingredients they have, prioritise those and minimise new buys.
+- Mode buttons like "tonight" / "special occasion" / "build a week" are intents only — the brief still wins on ingredients and constraints.
 
 WHEN YOU DELIVER A PLAN:
 - Short friendly summary (2–4 sentences), then a fenced JSON block the app can save:
@@ -89,7 +101,8 @@ WHEN YOU DELIVER A PLAN:
       }
     ]
   }
-- Respect the brief strictly: cuisines, cooking methods, proteins, pantry, avoid list, max cook time, budget, meal slots.
+- Respect the brief strictly: cuisines, cooking methods, proteins, pantry, avoid list, max cook time, budget, meal slots, notes.
+- Map "brunch" meal slot from the brief to "breakfast" in JSON if needed, but only include meals the brief asked for.
 - Variety: do NOT serve two similar dishes the same day (e.g. chicken stir-fry + beef stir-fry). Vary method/cuisine across meals.
 - If brunch + dinner: brunch should be lighter and stylistically different from dinner.
 - Costs in realistic UK GBP. Consistent ingredient naming/units across the plan.
@@ -121,13 +134,13 @@ function formatMealBrief(brief: Record<string, unknown> | null | undefined): str
   if (cook != null) lines.push(`- Max cook time per meal: ${cook} minutes`);
   if (cuisines.length) lines.push(`- Preferred cuisines: ${cuisines.join(', ')}`);
   if (methods.length) lines.push(`- Preferred cooking methods: ${methods.join(', ')}`);
-  if (proteins.length) lines.push(`- Proteins to use: ${proteins.join(', ')}`);
-  if (pantry.length) lines.push(`- Pantry / already have: ${pantry.join(', ')}`);
-  if (avoid) lines.push(`- Avoid / dislikes: ${avoid}`);
-  if (notes) lines.push(`- Extra notes: ${notes}`);
+  if (proteins.length) lines.push(`- Proteins to use (REQUIRED — do not substitute): ${proteins.join(', ')}`);
+  if (pantry.length) lines.push(`- Pantry / already have (prefer using): ${pantry.join(', ')}`);
+  if (avoid) lines.push(`- Avoid / dislikes (FORBIDDEN ingredients — never include): ${avoid}`);
+  if (notes) lines.push(`- Extra notes (REQUIRED preferences): ${notes}`);
 
   if (!lines.length) return '';
-  return `Structured meal brief from the app UI (treat as already answered — do not re-ask):\n${lines.join('\n')}`;
+  return `STRUCTURED MEAL BRIEF — OBEY EVERY LINE:\n${lines.join('\n')}`;
 }
 
 interface ChatMessage {
@@ -389,6 +402,51 @@ async function generateShoppingListForPlan(
   return { shoppingListId, totalCost };
 }
 
+function makeShareSlug(): string {
+  return crypto.randomBytes(9).toString('base64url').slice(0, 12);
+}
+
+async function loadRecipesForPlan(client: PoolClient, planId: number) {
+  const recipesResult = await client.query(
+    `SELECT id, day_of_week, meal_slot, title, instructions, prep_time, cook_time,
+            estimated_cost, calories, protein, carbs, fat
+     FROM recipes WHERE meal_plan_id = $1
+     ORDER BY id ASC`,
+    [planId]
+  );
+
+  const recipes = [];
+  for (const recipe of recipesResult.rows) {
+    const ingredientsResult = await client.query(
+      `SELECT ingredient_name, quantity, unit, category, estimated_price
+       FROM ingredients WHERE recipe_id = $1 ORDER BY id ASC`,
+      [recipe.id]
+    );
+    recipes.push({
+      id: recipe.id,
+      day_of_week: recipe.day_of_week,
+      meal_slot: recipe.meal_slot,
+      title: recipe.title,
+      instructions: recipe.instructions,
+      prep_time: recipe.prep_time,
+      cook_time: recipe.cook_time,
+      estimated_cost: recipe.estimated_cost != null ? parseFloat(recipe.estimated_cost) : null,
+      calories: recipe.calories,
+      protein: recipe.protein != null ? parseFloat(recipe.protein) : null,
+      carbs: recipe.carbs != null ? parseFloat(recipe.carbs) : null,
+      fat: recipe.fat != null ? parseFloat(recipe.fat) : null,
+      ingredients: ingredientsResult.rows.map((ing) => ({
+        ingredient_name: ing.ingredient_name,
+        quantity: ing.quantity != null ? parseFloat(ing.quantity) : null,
+        unit: ing.unit,
+        category: ing.category,
+        estimated_price: ing.estimated_price != null ? parseFloat(ing.estimated_price) : null,
+      })),
+    });
+  }
+  return recipes;
+}
+
 // ---------------------------------------------------------------------------
 // Express App
 // ---------------------------------------------------------------------------
@@ -620,6 +678,51 @@ app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
   }
 });
 
+app.post('/me/password', authLimiter, authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const { current_password, new_password } = req.body ?? {};
+    if (typeof current_password !== 'string' || !current_password) {
+      return res.status(400).json({ error: 'Current password is required.' });
+    }
+    if (typeof new_password !== 'string' || new_password.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters long.' });
+    }
+    if (current_password === new_password) {
+      return res.status(400).json({ error: 'New password must be different from the current password.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      const result = await client.query<{ password_hash: string }>(
+        'SELECT password_hash FROM users WHERE id = $1',
+        [user_id]
+      );
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      const matches = await bcrypt.compare(current_password, result.rows[0].password_hash);
+      if (!matches) {
+        return res.status(401).json({ error: 'Current password is incorrect.' });
+      }
+
+      const hashed = await bcrypt.hash(new_password, 10);
+      await client.query('UPDATE users SET password_hash = $2 WHERE id = $1', [user_id, hashed]);
+      res.json({ message: 'Password updated successfully.' });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /me/password failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Protected Routes
 // ---------------------------------------------------------------------------
@@ -692,6 +795,19 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
         role: row.sender === 'user' ? 'user' : 'assistant',
         content: row.message_text,
       }));
+
+      // Attach the live brief to the latest user turn so mode buttons ("tonight", etc.)
+      // cannot override Step 1 constraints.
+      const briefReminder = formatMealBrief(brief);
+      if (briefReminder && messages.length > 0) {
+        const lastIdx = messages.length - 1;
+        if (messages[lastIdx].role === 'user') {
+          messages[lastIdx] = {
+            role: 'user',
+            content: `${messages[lastIdx].content}\n\n${briefReminder}\n\nFollow the brief above exactly for proteins, meal slots, avoid list, and notes.`,
+          };
+        }
+      }
 
       const assistantText = await callMealPlanningAPI(messages, buildSystemPrompt(prefs, brief));
 
@@ -835,6 +951,8 @@ app.get('/meal-plans', authenticateToken, async (req: Request, res: Response) =>
          mp.total_estimated_cost,
          mp.servings,
          mp.status,
+         mp.is_public,
+         mp.share_slug,
          mp.created_at,
          (SELECT COUNT(*)::int FROM recipes r WHERE r.meal_plan_id = mp.id) AS recipes_count
        FROM meal_plans mp
@@ -851,6 +969,8 @@ app.get('/meal-plans', authenticateToken, async (req: Request, res: Response) =>
         total_estimated_cost: r.total_estimated_cost != null ? parseFloat(r.total_estimated_cost) : null,
         servings: r.servings,
         status: r.status,
+        is_public: Boolean(r.is_public),
+        share_slug: r.share_slug ?? null,
         created_at: r.created_at,
         recipes_count: r.recipes_count,
       })),
@@ -875,7 +995,7 @@ app.get('/meal-plan/:id', authenticateToken, async (req: Request, res: Response)
     const client = await pool.connect();
     try {
       const planResult = await client.query(
-        `SELECT id, plan_name, total_estimated_cost, servings, status, created_at
+        `SELECT id, plan_name, total_estimated_cost, servings, status, is_public, share_slug, created_at
          FROM meal_plans WHERE id = $1 AND user_id = $2`,
         [planId, user_id]
       );
@@ -883,44 +1003,7 @@ app.get('/meal-plan/:id', authenticateToken, async (req: Request, res: Response)
         return res.status(404).json({ error: 'Meal plan not found' });
       }
       const plan = planResult.rows[0];
-
-      const recipesResult = await client.query(
-        `SELECT id, day_of_week, meal_slot, title, instructions, prep_time, cook_time,
-                estimated_cost, calories, protein, carbs, fat
-         FROM recipes WHERE meal_plan_id = $1
-         ORDER BY id ASC`,
-        [planId]
-      );
-
-      const recipes = [];
-      for (const recipe of recipesResult.rows) {
-        const ingredientsResult = await client.query(
-          `SELECT ingredient_name, quantity, unit, category, estimated_price
-           FROM ingredients WHERE recipe_id = $1 ORDER BY id ASC`,
-          [recipe.id]
-        );
-        recipes.push({
-          id: recipe.id,
-          day_of_week: recipe.day_of_week,
-          meal_slot: recipe.meal_slot,
-          title: recipe.title,
-          instructions: recipe.instructions,
-          prep_time: recipe.prep_time,
-          cook_time: recipe.cook_time,
-          estimated_cost: recipe.estimated_cost != null ? parseFloat(recipe.estimated_cost) : null,
-          calories: recipe.calories,
-          protein: recipe.protein != null ? parseFloat(recipe.protein) : null,
-          carbs: recipe.carbs != null ? parseFloat(recipe.carbs) : null,
-          fat: recipe.fat != null ? parseFloat(recipe.fat) : null,
-          ingredients: ingredientsResult.rows.map((ing) => ({
-            ingredient_name: ing.ingredient_name,
-            quantity: ing.quantity != null ? parseFloat(ing.quantity) : null,
-            unit: ing.unit,
-            category: ing.category,
-            estimated_price: ing.estimated_price != null ? parseFloat(ing.estimated_price) : null,
-          })),
-        });
-      }
+      const recipes = await loadRecipesForPlan(client, planId);
 
       res.json({
         id: plan.id,
@@ -928,6 +1011,8 @@ app.get('/meal-plan/:id', authenticateToken, async (req: Request, res: Response)
         total_estimated_cost: plan.total_estimated_cost != null ? parseFloat(plan.total_estimated_cost) : null,
         servings: plan.servings,
         status: plan.status,
+        is_public: Boolean(plan.is_public),
+        share_slug: plan.share_slug ?? null,
         created_at: plan.created_at,
         recipes,
       });
@@ -936,6 +1021,142 @@ app.get('/meal-plan/:id', authenticateToken, async (req: Request, res: Response)
     }
   } catch (err) {
     log('ERROR', 'GET /meal-plan/:id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/meal-plan/:id/share', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const planId = parseInt(req.params.id, 10);
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (isNaN(planId) || planId < 1) {
+      return res.status(400).json({ error: 'Invalid plan id.' });
+    }
+    if (user_id == null) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const existing = await pool.query(
+      `SELECT id, plan_name, is_public, share_slug FROM meal_plans WHERE id = $1 AND user_id = $2`,
+      [planId, user_id]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Meal plan not found' });
+    }
+
+    let shareSlug = existing.rows[0].share_slug as string | null;
+    if (!shareSlug) {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const candidate = makeShareSlug();
+        try {
+          const updated = await pool.query(
+            `UPDATE meal_plans
+             SET is_public = TRUE, share_slug = $1, shared_at = CURRENT_TIMESTAMP
+             WHERE id = $2 AND user_id = $3
+             RETURNING share_slug, plan_name, is_public`,
+            [candidate, planId, user_id]
+          );
+          shareSlug = updated.rows[0].share_slug;
+          break;
+        } catch (err: unknown) {
+          const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: string }).code : null;
+          if (code !== '23505') throw err;
+        }
+      }
+      if (!shareSlug) {
+        return res.status(500).json({ error: 'Could not create share link.' });
+      }
+    } else if (!existing.rows[0].is_public) {
+      await pool.query(
+        `UPDATE meal_plans
+         SET is_public = TRUE, shared_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND user_id = $2`,
+        [planId, user_id]
+      );
+    }
+
+    res.json({
+      id: planId,
+      plan_name: existing.rows[0].plan_name,
+      is_public: true,
+      share_slug: shareSlug,
+    });
+  } catch (err) {
+    log('ERROR', 'POST /meal-plan/:id/share failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/meal-plan/:id/unshare', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const planId = parseInt(req.params.id, 10);
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (isNaN(planId) || planId < 1) {
+      return res.status(400).json({ error: 'Invalid plan id.' });
+    }
+    if (user_id == null) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const result = await pool.query(
+      `UPDATE meal_plans
+       SET is_public = FALSE
+       WHERE id = $1 AND user_id = $2
+       RETURNING id, plan_name, is_public, share_slug`,
+      [planId, user_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Meal plan not found' });
+    }
+
+    res.json({
+      id: result.rows[0].id,
+      plan_name: result.rows[0].plan_name,
+      is_public: false,
+      share_slug: result.rows[0].share_slug,
+    });
+  } catch (err) {
+    log('ERROR', 'POST /meal-plan/:id/unshare failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/share/:slug', async (req: Request, res: Response) => {
+  try {
+    const slug = String(req.params.slug || '').trim();
+    if (!slug || slug.length > 32) {
+      return res.status(400).json({ error: 'Invalid share link.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      const planResult = await client.query(
+        `SELECT mp.id, mp.plan_name, mp.total_estimated_cost, mp.servings, mp.share_slug, mp.shared_at, mp.created_at
+         FROM meal_plans mp
+         WHERE mp.share_slug = $1 AND mp.is_public = TRUE`,
+        [slug]
+      );
+      if (planResult.rows.length === 0) {
+        return res.status(404).json({ error: 'This recipe is private or the link is invalid.' });
+      }
+      const plan = planResult.rows[0];
+      const recipes = await loadRecipesForPlan(client, plan.id);
+
+      res.json({
+        id: plan.id,
+        plan_name: plan.plan_name,
+        total_estimated_cost: plan.total_estimated_cost != null ? parseFloat(plan.total_estimated_cost) : null,
+        servings: plan.servings,
+        share_slug: plan.share_slug,
+        shared_at: plan.shared_at,
+        created_at: plan.created_at,
+        recipes,
+      });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'GET /share/:slug failed', { err: String(err) });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
