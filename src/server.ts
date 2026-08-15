@@ -64,6 +64,21 @@ INTENT (from the app — honour it):
 - search: they named a dish, cuisine, or mood. Cook that one recipe now. Do not invent extra constraints they did not state.
 - create: they filled a complete brief. Cook exactly one recipe that obeys it. Do not ask questions.
 - tweak: they already have a recipe. Change it as asked and return one new JSON plan. Do not re-ask the brief.
+- suggest: do NOT write a recipe, method, or ingredients. Return exactly three distinct dish options as concise title-and-description choices using the schema below.
+- finalize: they selected one suggested dish and supplied any final tweak. Now return exactly one complete recipe plan for that selected dish.
+
+WHEN YOU SUGGEST OPTIONS:
+- Give exactly three genuinely different options that all obey the meal brief.
+- Keep each description to one sentence. Explain the style and appeal, not the full method.
+- Return a short friendly lead-in followed by this fenced JSON:
+\`\`\`json
+{
+  "options": [
+    { "title": "string", "description": "one concise sentence", "reason": "short fit with their brief" }
+  ]
+}
+\`\`\`
+- Never include ingredients, instructions, nutrition, or a meal plan while suggesting.
 
 CONVERSATION STYLE:
 - Keep chat light: in 1–2 sentences, confirm what you cooked, then deliver the plan.
@@ -222,6 +237,46 @@ interface ParsedMealPlan {
   }>;
 }
 
+interface DishOption {
+  title: string;
+  description: string;
+  reason?: string;
+}
+
+function parseDishOptions(text: string): DishOption[] | null {
+  let depth = 0;
+  let start = -1;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (text[i] === '}') {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        try {
+          const parsed = JSON.parse(text.slice(start, i + 1)) as { options?: unknown };
+          if (Array.isArray(parsed.options)) {
+            const options = parsed.options
+              .filter((option): option is Record<string, unknown> => Boolean(option) && typeof option === 'object')
+              .map((option) => ({
+                title: typeof option.title === 'string' ? option.title.trim() : '',
+                description: typeof option.description === 'string' ? option.description.trim() : '',
+                reason: typeof option.reason === 'string' ? option.reason.trim() : undefined,
+              }))
+              .filter((option) => option.title && option.description)
+              .slice(0, 3);
+            return options.length ? options : null;
+          }
+        } catch {
+          // not valid suggestion JSON, keep scanning
+        }
+        start = -1;
+      }
+    }
+  }
+  return null;
+}
+
 function parseRecipeJSON(text: string): ParsedMealPlan | null {
   // Scan for every top-level {...} block and return the first one that contains
   // a "recipes" array, rather than greedily matching from first { to last }.
@@ -248,6 +303,33 @@ function parseRecipeJSON(text: string): ParsedMealPlan | null {
     }
   }
   return null;
+}
+
+function messageWithoutOptionsBlock(text: string): string {
+  let out = text.replace(/```json\s*[\s\S]*?```/g, '');
+  let depth = 0;
+  let start = -1;
+  for (let i = 0; i < out.length; i++) {
+    if (out[i] === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (out[i] === '}') {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        try {
+          const parsed = JSON.parse(out.slice(start, i + 1)) as { options?: unknown };
+          if (Array.isArray(parsed.options)) {
+            out = out.slice(0, start) + out.slice(i + 1);
+            break;
+          }
+        } catch {
+          // not valid JSON, keep scanning
+        }
+        start = -1;
+      }
+    }
+  }
+  return out.replace(/\n{3,}/g, '\n\n').trim();
 }
 
 /** Remove the meal-plan JSON block from assistant text so the chat shows only conversational content. */
@@ -300,8 +382,10 @@ function buildSystemPrompt(
   let prompt = MEAL_PLANNING_SYSTEM_PROMPT;
 
   const cleanIntent = typeof intent === 'string' ? intent.trim().toLowerCase() : '';
-  if (cleanIntent === 'search' || cleanIntent === 'create' || cleanIntent === 'tweak') {
-    prompt += `\n\nACTIVE INTENT: ${cleanIntent}. Honour the INTENT rules above. Cook now — do not ask questions.`;
+  if (['search', 'create', 'tweak', 'suggest', 'finalize'].includes(cleanIntent)) {
+    prompt += cleanIntent === 'suggest'
+      ? '\n\nACTIVE INTENT: suggest. Present exactly three concise options using the options JSON schema. Do not cook yet.'
+      : `\n\nACTIVE INTENT: ${cleanIntent}. Honour the INTENT rules above. Cook now — do not ask questions.`;
   }
 
   const briefBlock = formatMealBrief(mealBrief);
@@ -1005,7 +1089,14 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
       );
 
       const mealPlan = parseRecipeJSON(assistantText);
-      const displayMessage = mealPlan ? messageWithoutJsonBlock(assistantText) : assistantText;
+      const dishOptions = String(intent || '').toLowerCase() === 'suggest'
+        ? parseDishOptions(assistantText)
+        : null;
+      const displayMessage = mealPlan
+        ? messageWithoutJsonBlock(assistantText)
+        : dishOptions
+          ? messageWithoutOptionsBlock(assistantText)
+          : assistantText;
       let planForClient = mealPlan;
       if (mealPlan) {
         try {
@@ -1027,6 +1118,7 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
 
       res.json({
         message: displayMessage,
+        ...(dishOptions && { options: dishOptions }),
         ...(planForClient && { meal_plan: planForClient }),
       });
     } finally {
