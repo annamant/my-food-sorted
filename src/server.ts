@@ -474,7 +474,11 @@ async function loadRecipesForPlan(client: PoolClient, planId: number) {
 
 const app = express();
 
-app.use(helmet());
+app.use(helmet({
+  // Allow the Railway frontend (and local Vite) to read API responses in Safari.
+  // Helmet's default same-origin CORP blocks cross-origin fetch even when CORS allows it.
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
 const corsOrigins = config.CORS_ORIGINS === '' || config.CORS_ORIGINS === '*' ? undefined : config.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean);
 app.use(cors(corsOrigins ? { origin: corsOrigins } : {}));
 app.use(express.json({ limit: config.JSON_BODY_LIMIT }));
@@ -517,7 +521,7 @@ app.post('/register', authLimiter, async (req: Request, res: Response) => {
         [email.trim(), hashedPassword]
       );
       const user = result.rows[0];
-      const token = jwt.sign({ userId: user.id, email: user.email }, config.JWT_SECRET, { expiresIn: '1h' });
+      const token = jwt.sign({ userId: user.id, email: user.email }, config.JWT_SECRET, { expiresIn: '7d' });
       res.status(201).json({
         message: 'User registered successfully',
         token,
@@ -565,7 +569,7 @@ app.post('/login', authLimiter, async (req: Request, res: Response) => {
         return res.status(401).json({ error: 'Invalid credentials' });
       }
 
-      const token = jwt.sign({ userId: user.id, email: user.email }, config.JWT_SECRET, { expiresIn: '1h' });
+      const token = jwt.sign({ userId: user.id, email: user.email }, config.JWT_SECRET, { expiresIn: '7d' });
       res.json({
         message: 'Logged in successfully',
         token,

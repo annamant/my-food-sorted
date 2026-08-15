@@ -111,6 +111,16 @@ CREATE TABLE IF NOT EXISTS shopping_lists (
 CREATE INDEX IF NOT EXISTS idx_shopping_lists_meal_plan_id ON shopping_lists(meal_plan_id);
 CREATE INDEX IF NOT EXISTS idx_shopping_lists_created_at ON shopping_lists(created_at);
 
+-- Existing databases created before meal_plan_id UNIQUE
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'shopping_lists_meal_plan_id_key'
+  ) THEN
+    ALTER TABLE shopping_lists ADD CONSTRAINT shopping_lists_meal_plan_id_key UNIQUE (meal_plan_id);
+  END IF;
+END $$;
+
 -- Shopping list items
 CREATE TABLE IF NOT EXISTS shopping_list_items (
   id SERIAL PRIMARY KEY,
