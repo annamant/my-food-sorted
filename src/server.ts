@@ -74,11 +74,22 @@ WHEN YOU SUGGEST OPTIONS:
 \`\`\`json
 {
   "options": [
-    { "title": "string", "description": "one concise sentence", "reason": "short fit with their brief" }
+    {
+      "title": "string",
+      "description": "one concise sentence",
+      "reason": "short fit with their brief",
+      "estimated_cost": 8.5,
+      "calories": 620,
+      "protein": 35,
+      "carbs": 58,
+      "fat": 24,
+      "sugar": 9
+    }
   ]
 }
 \`\`\`
-- Never include ingredients, instructions, nutrition, or a meal plan while suggesting.
+- Cost is an approximate total in UK GBP for the requested servings. Nutrition is an approximate per-serving value in grams, except calories in kcal.
+- Never include an ingredient list, instructions, or a meal plan while suggesting; nutrition must stay at rough summary level.
 
 CONVERSATION STYLE:
 - Keep chat light: in 1–2 sentences, confirm what you cooked, then deliver the plan.
@@ -241,6 +252,12 @@ interface DishOption {
   title: string;
   description: string;
   reason?: string;
+  estimated_cost?: number;
+  calories?: number;
+  protein?: number;
+  carbs?: number;
+  fat?: number;
+  sugar?: number;
 }
 
 function parseDishOptions(text: string): DishOption[] | null {
@@ -256,12 +273,20 @@ function parseDishOptions(text: string): DishOption[] | null {
         try {
           const parsed = JSON.parse(text.slice(start, i + 1)) as { options?: unknown };
           if (Array.isArray(parsed.options)) {
+            const optionalNumber = (value: unknown) =>
+              typeof value === 'number' && Number.isFinite(value) ? value : undefined;
             const options = parsed.options
               .filter((option): option is Record<string, unknown> => Boolean(option) && typeof option === 'object')
               .map((option) => ({
                 title: typeof option.title === 'string' ? option.title.trim() : '',
                 description: typeof option.description === 'string' ? option.description.trim() : '',
                 reason: typeof option.reason === 'string' ? option.reason.trim() : undefined,
+                estimated_cost: optionalNumber(option.estimated_cost),
+                calories: optionalNumber(option.calories),
+                protein: optionalNumber(option.protein),
+                carbs: optionalNumber(option.carbs),
+                fat: optionalNumber(option.fat),
+                sugar: optionalNumber(option.sugar),
               }))
               .filter((option) => option.title && option.description)
               .slice(0, 3);
