@@ -135,3 +135,33 @@ CREATE TABLE IF NOT EXISTS shopping_list_items (
 
 CREATE INDEX IF NOT EXISTS idx_shopping_list_items_shopping_list_id ON shopping_list_items(shopping_list_id);
 CREATE INDEX IF NOT EXISTS idx_shopping_list_items_checked ON shopping_list_items(checked);
+
+-- House catalog (classics that already exist — not per-user meal_plans)
+CREATE TABLE IF NOT EXISTS collections (
+  id SERIAL PRIMARY KEY,
+  slug VARCHAR(64) UNIQUE NOT NULL,
+  title VARCHAR(255) NOT NULL,
+  blurb TEXT,
+  cover_url TEXT,
+  sort_order INT DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS catalog_recipes (
+  id SERIAL PRIMARY KEY,
+  slug VARCHAR(128) UNIQUE NOT NULL,
+  title VARCHAR(255) NOT NULL,
+  blurb TEXT,
+  image_url TEXT,
+  payload JSONB NOT NULL,
+  search_text TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS catalog_recipe_collections (
+  catalog_recipe_id INT NOT NULL REFERENCES catalog_recipes(id) ON DELETE CASCADE,
+  collection_id INT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+  PRIMARY KEY (catalog_recipe_id, collection_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_catalog_recipes_search ON catalog_recipes (search_text);
+CREATE INDEX IF NOT EXISTS idx_catalog_recipe_collections_collection ON catalog_recipe_collections (collection_id);

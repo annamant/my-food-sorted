@@ -960,10 +960,12 @@ app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) =>
         [totalEstimatedCost, mealPlanId]
       );
 
+      await generateShoppingListForPlan(client, mealPlanId);
       await client.query('COMMIT');
 
       res.status(201).json({
         meal_plan_id: mealPlanId,
+        id: mealPlanId,
         plan_name: plan_name.trim(),
         total_estimated_cost: totalEstimatedCost,
         servings,
@@ -1477,6 +1479,30 @@ async function applySchemaAndStart() {
   try {
     const schemaSql = fs.readFileSync(path.join(__dirname, 'db', 'schema.sql'), 'utf8');
     await pool.query(schemaSql);
+    const existing = await pool.query('SELECT count(*)::int AS n FROM collections');
+    if ((existing.rows[0]?.n ?? 0) === 0) {
+      const rows = [
+        ['italian', 'Italian classics', 'Carbonara, ragù, risotto — the real ones.', 1],
+        ['french', 'French classics', 'Bistro plates you can cook at home.', 2],
+        ['british', 'British comfort', 'Sunday energy, weeknight ease.', 3],
+        ['japanese', 'Japanese favourites', 'Clean flavours, weeknight-friendly.', 4],
+        ['indian', 'Indian classics', 'Spice, warmth, and balance.', 5],
+        ['mexican', 'Mexican kitchen', 'Bright, bold, shareable plates.', 6],
+        ['mediterranean', 'Mediterranean', 'Olive oil, herbs, sunshine plates.', 7],
+        ['vegetarian', 'Vegetarian', 'No meat — still proper supper.', 8],
+        ['vegan', 'Vegan', 'Plant-based, cooked with care.', 9],
+        ['wellbeing', 'High-protein', 'Wellbeing without sad salads.', 10],
+        ['budget', 'Budget week', 'Feed well when prices bite.', 11],
+        ['pantry', 'From the cupboard', 'Cook what you already have.', 12],
+      ];
+      for (const [slug, title, blurb, sort] of rows) {
+        await pool.query(
+          'INSERT INTO collections (slug, title, blurb, sort_order) VALUES ($1, $2, $3, $4) ON CONFLICT (slug) DO NOTHING',
+          [slug, title, blurb, sort]
+        );
+      }
+      log('INFO', 'Seeded house collections');
+    }
     log('INFO', 'Database schema up to date');
   } catch (err) {
     log('ERROR', 'Failed to apply database schema', { err: err instanceof Error ? err.message : String(err) });
