@@ -53,13 +53,14 @@ CREATE TABLE IF NOT EXISTS meal_plans (
 CREATE INDEX IF NOT EXISTS idx_meal_plans_user_id ON meal_plans(user_id);
 CREATE INDEX IF NOT EXISTS idx_meal_plans_status ON meal_plans(status);
 CREATE INDEX IF NOT EXISTS idx_meal_plans_created_at ON meal_plans(created_at);
-CREATE INDEX IF NOT EXISTS idx_meal_plans_share_slug ON meal_plans(share_slug) WHERE share_slug IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_meal_plans_is_public ON meal_plans(is_public) WHERE is_public = TRUE;
 
--- Existing databases: add share columns if missing
+-- Existing databases: add share columns before indexes that depend on them
 ALTER TABLE meal_plans ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE meal_plans ADD COLUMN IF NOT EXISTS share_slug VARCHAR(32) UNIQUE;
 ALTER TABLE meal_plans ADD COLUMN IF NOT EXISTS shared_at TIMESTAMP;
+
+CREATE INDEX IF NOT EXISTS idx_meal_plans_share_slug ON meal_plans(share_slug) WHERE share_slug IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_meal_plans_is_public ON meal_plans(is_public) WHERE is_public = TRUE;
 
 -- Recipes (linked to meal plans)
 CREATE TABLE IF NOT EXISTS recipes (
@@ -75,8 +76,12 @@ CREATE TABLE IF NOT EXISTS recipes (
   calories INT,
   protein DECIMAL(10, 2),
   carbs DECIMAL(10, 2),
-  fat DECIMAL(10, 2)
+  fat DECIMAL(10, 2),
+  image_url TEXT
 );
+
+-- Existing databases: store a photo of the actual dish
+ALTER TABLE recipes ADD COLUMN IF NOT EXISTS image_url TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_recipes_meal_plan_id ON recipes(meal_plan_id);
 CREATE INDEX IF NOT EXISTS idx_recipes_day_meal ON recipes(meal_plan_id, day_of_week, meal_slot);

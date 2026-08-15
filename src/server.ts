@@ -11,6 +11,7 @@ import cors from 'cors';
 import * as fs from 'fs';
 import * as path from 'path';
 import { config, RETAILERS, type Retailer } from './config';
+import { attachRecipeImages, isAllowedImageUrl } from './recipeImages';
 
 // Config is validated at import (config.ts); server exits if JWT_SECRET or OPENAI_API_KEY missing.
 
@@ -50,21 +51,26 @@ STRUCTURED MEAL BRIEF (HARD CONSTRAINTS — NON-NEGOTIABLE):
 - When a brief is present, you MUST obey it completely. Do not invent conflicting choices.
 - Proteins listed: use those proteins as the main protein(s). Do not switch to chicken/fish/veg if they asked for beef (etc.).
 - Meal slots listed: only create those meal types. If only "dinner" is listed, do NOT add brunch/lunch/breakfast.
+- Breakfast is its own meal — morning food, not a late brunch unless they ticked brunch.
+- If the brief includes a special occasion / one-off: cook a celebratory standout dish (guests, a treat, a night that matters). Use dinner in JSON unless they also named another slot. Do not make it a plain weeknight plate.
 - Avoid / dislikes: never include those ingredients (e.g. no garlic means zero garlic in ingredients or method).
 - Extra notes: treat as required preferences (e.g. "lots of onions" means the dish should feature onions generously).
 - Pantry items: prefer using them; do not ignore them when the user is cooking from the cupboard.
 - Budget, cook-time, servings, days, cuisines, methods: respect them.
-- Treat the brief as already answered. Do NOT re-ask those topics.
-- Only ask about genuine gaps, in natural chat — never a numbered 1–5 questionnaire.
-- At most one short follow-up if something critical is missing; otherwise go ahead and plan.
+- Filters are collected in the app. NEVER interview, NEVER ask a questionnaire, NEVER ask follow-up questions before cooking.
+- If something minor is missing, pick a sensible UK weeknight default and cook.
+
+INTENT (from the app — honour it):
+- search: they named a dish, cuisine, or mood. Cook that one recipe now. Do not invent extra constraints they did not state.
+- create: they filled a complete brief. Cook exactly one recipe that obeys it. Do not ask questions.
+- tweak: they already have a recipe. Change it as asked and return one new JSON plan. Do not re-ask the brief.
 
 CONVERSATION STYLE:
-- Prefer using the brief + a short free-text message from the user.
-- Keep chat light: in 1–2 sentences, explicitly confirm the key brief choices you followed (e.g. "Beef dinner, no garlic, plenty of onion"), then deliver the plan.
-- Classics: if they ask for a known dish (e.g. carbonara), adapt it to the brief (protein swaps, avoid list, notes) rather than ignoring the brief for authenticity.
-- Remix requests: when they ask to cut calories, cost, swap ingredients, or adapt for diet — rewrite the dish and deliver a full new JSON plan, still obeying the brief.
+- Keep chat light: in 1–2 sentences, confirm what you cooked, then deliver the plan.
+- Classics: if they ask for a known dish (e.g. carbonara), cook that dish (adapted only for avoid list / diet / servings).
+- Remix requests: rewrite the dish and deliver a full new JSON plan.
 - Pantry-first: if they list ingredients they have, prioritise those and minimise new buys.
-- Mode buttons like "tonight" / "special occasion" / "build a week" are intents only — the brief still wins on ingredients and constraints.
+- Do not mention internal intents, JSON, or the brief format to the user.
 
 WHEN YOU DELIVER A PLAN:
 - Short friendly summary (2–4 sentences), then a fenced JSON block the app can save:
@@ -89,6 +95,7 @@ WHEN YOU DELIVER A PLAN:
         "protein": number,
         "carbs": number,
         "fat": number,
+        "image_query": "string",
         "ingredients": [
           {
             "ingredient_name": "string",
@@ -101,6 +108,8 @@ WHEN YOU DELIVER A PLAN:
       }
     ]
   }
+- image_query: 2–5 word common dish name used only to find a photo (e.g. "spaghetti carbonara", "chicken tikka masala", "chilli con carne"). Not a poetic title.
+- NEVER invent image, photo, or Unsplash/Pexels URLs. The app looks up photos itself. Any image URL you include will be ignored.
 - Respect the brief strictly: cuisines, cooking methods, proteins, pantry, avoid list, max cook time, budget, meal slots, notes.
 - Map "brunch" meal slot from the brief to "breakfast" in JSON if needed, but only include meals the brief asked for.
 - Variety: do NOT serve two similar dishes the same day (e.g. chicken stir-fry + beef stir-fry). Vary method/cuisine across meals.
@@ -201,6 +210,8 @@ interface ParsedMealPlan {
     protein?: number;
     carbs?: number;
     fat?: number;
+    image_query?: string;
+    image?: string;
     ingredients?: Array<{
       ingredient_name?: string;
       quantity?: number;
@@ -281,8 +292,17 @@ interface UserPrefs {
   preferred_retailer: string | null;
 }
 
-function buildSystemPrompt(prefs: UserPrefs | null, mealBrief?: Record<string, unknown> | null): string {
+function buildSystemPrompt(
+  prefs: UserPrefs | null,
+  mealBrief?: Record<string, unknown> | null,
+  intent?: string | null,
+): string {
   let prompt = MEAL_PLANNING_SYSTEM_PROMPT;
+
+  const cleanIntent = typeof intent === 'string' ? intent.trim().toLowerCase() : '';
+  if (cleanIntent === 'search' || cleanIntent === 'create' || cleanIntent === 'tweak') {
+    prompt += `\n\nACTIVE INTENT: ${cleanIntent}. Honour the INTENT rules above. Cook now — do not ask questions.`;
+  }
 
   const briefBlock = formatMealBrief(mealBrief);
   if (briefBlock) {
@@ -409,7 +429,7 @@ function makeShareSlug(): string {
 async function loadRecipesForPlan(client: PoolClient, planId: number) {
   const recipesResult = await client.query(
     `SELECT id, day_of_week, meal_slot, title, instructions, prep_time, cook_time,
-            estimated_cost, calories, protein, carbs, fat
+            estimated_cost, calories, protein, carbs, fat, image_url
      FROM recipes WHERE meal_plan_id = $1
      ORDER BY id ASC`,
     [planId]
@@ -435,6 +455,7 @@ async function loadRecipesForPlan(client: PoolClient, planId: number) {
       protein: recipe.protein != null ? parseFloat(recipe.protein) : null,
       carbs: recipe.carbs != null ? parseFloat(recipe.carbs) : null,
       fat: recipe.fat != null ? parseFloat(recipe.fat) : null,
+      image: isAllowedImageUrl(recipe.image_url) ? recipe.image_url : null,
       ingredients: ingredientsResult.rows.map((ing) => ({
         ingredient_name: ing.ingredient_name,
         quantity: ing.quantity != null ? parseFloat(ing.quantity) : null,
@@ -729,7 +750,7 @@ app.post('/me/password', authLimiter, authenticateToken, async (req: Request, re
 
 app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const { user_message, conversation_id, meal_brief } = req.body;
+    const { user_message, conversation_id, meal_brief, intent } = req.body;
     const user_id = (req as AuthenticatedRequest).user?.userId;
 
     if (
@@ -809,7 +830,7 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
         }
       }
 
-      const assistantText = await callMealPlanningAPI(messages, buildSystemPrompt(prefs, brief));
+      const assistantText = await callMealPlanningAPI(messages, buildSystemPrompt(prefs, brief, intent));
 
       await client.query(
         'INSERT INTO chat_messages (user_id, sender, message_text, conversation_id) VALUES ($1, $2, $3, $4)',
@@ -818,10 +839,28 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
 
       const mealPlan = parseRecipeJSON(assistantText);
       const displayMessage = mealPlan ? messageWithoutJsonBlock(assistantText) : assistantText;
+      let planForClient = mealPlan;
+      if (mealPlan) {
+        try {
+          planForClient = await attachRecipeImages(mealPlan, config.UNSPLASH_ACCESS_KEY);
+        } catch (imgErr) {
+          log('WARN', 'Recipe image lookup failed', { err: String(imgErr) });
+          planForClient = {
+            ...mealPlan,
+            recipes: (mealPlan.recipes || []).map((recipe) => {
+              const rest = { ...recipe };
+              delete rest.image;
+              delete rest.image_query;
+              return rest;
+            }),
+          };
+          delete (planForClient as { image?: string }).image;
+        }
+      }
 
       res.json({
         message: displayMessage,
-        ...(mealPlan && { meal_plan: mealPlan }),
+        ...(planForClient && { meal_plan: planForClient }),
       });
     } finally {
       client.release();
@@ -885,13 +924,14 @@ app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) =>
         const protein = typeof r.protein === 'number' ? r.protein : null;
         const carbs = typeof r.carbs === 'number' ? r.carbs : null;
         const fat = typeof r.fat === 'number' ? r.fat : null;
+        const imageUrl = isAllowedImageUrl(r.image) ? r.image : null;
 
         totalEstimatedCost += estimatedCost;
 
         const recipeResult = await client.query<{ id: number }>(
-          `INSERT INTO recipes (meal_plan_id, day_of_week, meal_slot, title, instructions, prep_time, cook_time, estimated_cost, calories, protein, carbs, fat)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
-          [mealPlanId, dayOfWeek, mealSlot, title, instructions, prepTime, cookTime, estimatedCost, calories, protein, carbs, fat]
+          `INSERT INTO recipes (meal_plan_id, day_of_week, meal_slot, title, instructions, prep_time, cook_time, estimated_cost, calories, protein, carbs, fat, image_url)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
+          [mealPlanId, dayOfWeek, mealSlot, title, instructions, prepTime, cookTime, estimatedCost, calories, protein, carbs, fat, imageUrl]
         );
         const recipeId = recipeResult.rows[0].id;
 

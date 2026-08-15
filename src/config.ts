@@ -36,6 +36,9 @@ export const config = {
   OPENAI_MODEL: optionalEnv('OPENAI_MODEL', 'gpt-4o-mini'),
   OPENAI_MAX_TOKENS: parseInt(optionalEnv('OPENAI_MAX_TOKENS', '4096'), 10),
 
+  /** Optional Unsplash access key — used to find a photo of the actual dish. */
+  UNSPLASH_ACCESS_KEY: optionalEnv('UNSPLASH_ACCESS_KEY', ''),
+
   /** UTM source tag appended to retailer affiliate links. */
   UTM_SOURCE: optionalEnv('UTM_SOURCE', 'my-food-sorted'),
 } as const;
