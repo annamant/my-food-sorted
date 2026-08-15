@@ -468,6 +468,169 @@ async function loadRecipesForPlan(client: PoolClient, planId: number) {
   return recipes;
 }
 
+async function ensureLikedPlaylist(client: PoolClient, userId: number): Promise<number> {
+  const existing = await client.query<{ id: number }>(
+    `SELECT id FROM playlists WHERE user_id = $1 AND kind = 'liked' LIMIT 1`,
+    [userId]
+  );
+  if (existing.rows[0]) return existing.rows[0].id;
+  const created = await client.query<{ id: number }>(
+    `INSERT INTO playlists (user_id, title, blurb, kind)
+     VALUES ($1, 'Liked', 'Dishes you kept.', 'liked')
+     RETURNING id`,
+    [userId]
+  );
+  return created.rows[0].id;
+}
+
+async function serializePlaylist(
+  client: PoolClient,
+  playlistId: number,
+  userId?: number | null,
+  opts?: { includeTracks?: boolean }
+) {
+  const ownerFilter = userId != null ? 'AND p.user_id = $2' : '';
+  const params = userId != null ? [playlistId, userId] : [playlistId];
+  const result = await client.query(
+    `SELECT
+       p.id, p.title, p.blurb, p.kind, p.is_public, p.share_slug, p.created_at,
+       (SELECT COUNT(*)::int FROM playlist_items i WHERE i.playlist_id = p.id) AS tracks_count,
+       (
+         SELECT r.image_url
+         FROM playlist_items i
+         JOIN recipes r ON r.meal_plan_id = i.meal_plan_id
+         WHERE i.playlist_id = p.id
+         ORDER BY i.sort_order ASC, r.id ASC
+         LIMIT 1
+       ) AS cover_url
+     FROM playlists p
+     WHERE p.id = $1 ${ownerFilter}`,
+    params
+  );
+  if (!result.rows[0]) return null;
+  const row = result.rows[0];
+  const playlist = {
+    id: row.id,
+    title: row.title,
+    blurb: row.blurb,
+    kind: row.kind,
+    is_public: Boolean(row.is_public),
+    share_slug: row.share_slug ?? null,
+    created_at: row.created_at,
+    tracks_count: row.tracks_count,
+    cover_url: isAllowedImageUrl(row.cover_url) ? row.cover_url : null,
+    tracks: [] as Array<Record<string, unknown>>,
+  };
+  if (opts?.includeTracks) {
+    const tracks = await client.query(
+      `SELECT
+         i.meal_plan_id, i.sort_order, mp.plan_name, mp.servings, mp.total_estimated_cost,
+         (
+           SELECT r.image_url FROM recipes r
+           WHERE r.meal_plan_id = mp.id
+           ORDER BY r.id ASC LIMIT 1
+         ) AS image_url
+       FROM playlist_items i
+       JOIN meal_plans mp ON mp.id = i.meal_plan_id
+       WHERE i.playlist_id = $1
+       ORDER BY i.sort_order ASC, i.added_at ASC`,
+      [playlistId]
+    );
+    playlist.tracks = tracks.rows.map((t) => ({
+      meal_plan_id: t.meal_plan_id,
+      sort_order: t.sort_order,
+      plan_name: t.plan_name,
+      servings: t.servings,
+      total_estimated_cost: t.total_estimated_cost != null ? parseFloat(t.total_estimated_cost) : null,
+      image: isAllowedImageUrl(t.image_url) ? t.image_url : null,
+    }));
+  }
+  return playlist;
+}
+
+async function generateShoppingListForPlaylist(
+  client: PoolClient,
+  playlistId: number
+): Promise<{ shoppingListId: number; totalCost: number }> {
+  const upsert = await client.query<{ id: number }>(
+    `INSERT INTO playlist_shopping_lists (playlist_id, total_cost)
+     VALUES ($1, 0)
+     ON CONFLICT (playlist_id) DO UPDATE SET playlist_id = EXCLUDED.playlist_id
+     RETURNING id`,
+    [playlistId]
+  );
+  const shoppingListId = upsert.rows[0].id;
+
+  const prevChecked = await client.query<{
+    ingredient_name: string;
+    unit: string | null;
+    checked: boolean;
+  }>(
+    `SELECT ingredient_name, unit, checked FROM playlist_shopping_list_items WHERE shopping_list_id = $1`,
+    [shoppingListId]
+  );
+  const checkedMap = new Map<string, boolean>();
+  for (const row of prevChecked.rows) {
+    const key = `${(row.ingredient_name || '').toLowerCase().trim()}|${(row.unit || '').toLowerCase().trim()}`;
+    if (row.checked) checkedMap.set(key, true);
+  }
+
+  await client.query('DELETE FROM playlist_shopping_list_items WHERE shopping_list_id = $1', [shoppingListId]);
+
+  const aggResult = await client.query(
+    `SELECT
+       MIN(i.ingredient_name) AS ingredient_name,
+       COALESCE(MIN(i.unit), '') AS unit,
+       i.category,
+       SUM(i.quantity) AS quantity,
+       SUM(i.estimated_price) AS estimated_price
+     FROM ingredients i
+     JOIN recipes r ON r.id = i.recipe_id
+     JOIN playlist_items pi ON pi.meal_plan_id = r.meal_plan_id
+     WHERE pi.playlist_id = $1
+     GROUP BY LOWER(TRIM(i.ingredient_name)), COALESCE(LOWER(TRIM(i.unit)), ''), i.category`,
+    [playlistId]
+  );
+
+  let totalCost = 0;
+  for (const row of aggResult.rows) {
+    const qty = row.quantity != null ? parseFloat(row.quantity) : null;
+    const price = row.estimated_price != null ? parseFloat(row.estimated_price) : null;
+    if (price != null) totalCost += price;
+    const unit = row.unit === '' ? null : row.unit;
+    const key = `${(row.ingredient_name || '').toLowerCase().trim()}|${(unit || '').toLowerCase().trim()}`;
+    const checked = checkedMap.get(key) === true;
+    await client.query(
+      `INSERT INTO playlist_shopping_list_items (shopping_list_id, ingredient_name, quantity, unit, category, estimated_price, checked)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [shoppingListId, row.ingredient_name, qty, unit, row.category, price, checked]
+    );
+  }
+
+  await client.query('UPDATE playlist_shopping_lists SET total_cost = $1 WHERE id = $2', [totalCost, shoppingListId]);
+  return { shoppingListId, totalCost };
+}
+
+async function loadPlaylistShoppingList(client: PoolClient, playlistId: number) {
+  const list = await client.query<{ id: number; total_cost: string | null }>(
+    'SELECT id, total_cost FROM playlist_shopping_lists WHERE playlist_id = $1',
+    [playlistId]
+  );
+  if (!list.rows[0]) return null;
+  const items = await client.query<ShoppingItemRow>(
+    `SELECT id, ingredient_name, quantity, unit, category, estimated_price, checked
+     FROM playlist_shopping_list_items WHERE shopping_list_id = $1
+     ORDER BY category NULLS LAST, ingredient_name`,
+    [list.rows[0].id]
+  );
+  return {
+    shopping_list_id: list.rows[0].id,
+    playlist_id: playlistId,
+    items: mapShoppingItems(items.rows),
+    total_cost: list.rows[0].total_cost != null ? parseFloat(list.rows[0].total_cost) : 0,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Express App
 // ---------------------------------------------------------------------------
@@ -961,6 +1124,18 @@ app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) =>
       );
 
       await generateShoppingListForPlan(client, mealPlanId);
+      const likedId = await ensureLikedPlaylist(client, Number(user_id));
+      const maxOrder = await client.query<{ n: number }>(
+        'SELECT COALESCE(MAX(sort_order), -1)::int AS n FROM playlist_items WHERE playlist_id = $1',
+        [likedId]
+      );
+      await client.query(
+        `INSERT INTO playlist_items (playlist_id, meal_plan_id, sort_order)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (playlist_id, meal_plan_id) DO NOTHING`,
+        [likedId, mealPlanId, (maxOrder.rows[0]?.n ?? -1) + 1]
+      );
+      await generateShoppingListForPlaylist(client, likedId);
       await client.query('COMMIT');
 
       res.status(201).json({
@@ -1167,6 +1342,48 @@ app.post('/meal-plan/:id/unshare', authenticateToken, async (req: Request, res: 
   }
 });
 
+app.get('/share/list/:slug', async (req: Request, res: Response) => {
+  try {
+    const slug = String(req.params.slug || '').trim();
+    if (!slug || slug.length > 32) {
+      return res.status(400).json({ error: 'Invalid share link.' });
+    }
+    const client = await pool.connect();
+    try {
+      const found = await client.query<{ id: number }>(
+        `SELECT id FROM playlists WHERE share_slug = $1 AND is_public = TRUE`,
+        [slug]
+      );
+      if (!found.rows[0]) {
+        return res.status(404).json({ error: 'This list is private or the link is invalid.' });
+      }
+      const playlist = await serializePlaylist(client, found.rows[0].id, null, { includeTracks: true });
+      if (!playlist) {
+        return res.status(404).json({ error: 'This list is private or the link is invalid.' });
+      }
+      const dishes = [];
+      for (const track of playlist.tracks) {
+        const planId = Number(track.meal_plan_id);
+        const recipes = await loadRecipesForPlan(client, planId);
+        dishes.push({
+          meal_plan_id: planId,
+          plan_name: track.plan_name,
+          servings: track.servings,
+          total_estimated_cost: track.total_estimated_cost,
+          image: track.image,
+          recipes,
+        });
+      }
+      res.json({ ...playlist, dishes });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'GET /share/list/:slug failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.get('/share/:slug', async (req: Request, res: Response) => {
   try {
     const slug = String(req.params.slug || '').trim();
@@ -1203,6 +1420,426 @@ app.get('/share/:slug', async (req: Request, res: Response) => {
     }
   } catch (err) {
     log('ERROR', 'GET /share/:slug failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/playlists', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    const client = await pool.connect();
+    try {
+      await ensureLikedPlaylist(client, user_id);
+      const rows = await client.query<{ id: number }>(
+        `SELECT id FROM playlists WHERE user_id = $1 ORDER BY (kind = 'liked') DESC, created_at DESC`,
+        [user_id]
+      );
+      const playlists = [];
+      for (const row of rows.rows) {
+        const serialized = await serializePlaylist(client, row.id, user_id, { includeTracks: false });
+        if (serialized) playlists.push(serialized);
+      }
+      res.json({ playlists });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'GET /playlists failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/playlists', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim().slice(0, 255) : '';
+    const blurb = typeof req.body?.blurb === 'string' ? req.body.blurb.trim().slice(0, 500) : '';
+    if (!title) return res.status(400).json({ error: 'Give the list a name.' });
+    const client = await pool.connect();
+    try {
+      const created = await client.query<{ id: number }>(
+        `INSERT INTO playlists (user_id, title, blurb, kind) VALUES ($1, $2, $3, 'custom') RETURNING id`,
+        [user_id, title, blurb || null]
+      );
+      const playlist = await serializePlaylist(client, created.rows[0].id, user_id, { includeTracks: true });
+      res.status(201).json(playlist);
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /playlists failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/playlists/:id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const playlistId = parseInt(req.params.id, 10);
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    if (isNaN(playlistId) || playlistId < 1) return res.status(400).json({ error: 'Invalid list id.' });
+    const client = await pool.connect();
+    try {
+      const playlist = await serializePlaylist(client, playlistId, user_id, { includeTracks: true });
+      if (!playlist) return res.status(404).json({ error: 'List not found' });
+      res.json(playlist);
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'GET /playlists/:id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.patch('/playlists/:id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const playlistId = parseInt(req.params.id, 10);
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    if (isNaN(playlistId) || playlistId < 1) return res.status(400).json({ error: 'Invalid list id.' });
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim().slice(0, 255) : null;
+    const blurb = typeof req.body?.blurb === 'string' ? req.body.blurb.trim().slice(0, 500) : null;
+    const client = await pool.connect();
+    try {
+      const existing = await client.query<{ kind: string }>(
+        'SELECT kind FROM playlists WHERE id = $1 AND user_id = $2',
+        [playlistId, user_id]
+      );
+      if (!existing.rows[0]) return res.status(404).json({ error: 'List not found' });
+      if (existing.rows[0].kind === 'liked' && title) {
+        return res.status(400).json({ error: 'Liked cannot be renamed.' });
+      }
+      await client.query(
+        `UPDATE playlists SET
+           title = COALESCE($1, title),
+           blurb = COALESCE($2, blurb)
+         WHERE id = $3 AND user_id = $4`,
+        [title || null, blurb, playlistId, user_id]
+      );
+      const playlist = await serializePlaylist(client, playlistId, user_id, { includeTracks: true });
+      res.json(playlist);
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'PATCH /playlists/:id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/playlists/:id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const playlistId = parseInt(req.params.id, 10);
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    if (isNaN(playlistId) || playlistId < 1) return res.status(400).json({ error: 'Invalid list id.' });
+    const result = await pool.query(
+      `DELETE FROM playlists WHERE id = $1 AND user_id = $2 AND kind = 'custom' RETURNING id`,
+      [playlistId, user_id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'List not found, or Liked cannot be deleted.' });
+    res.json({ ok: true });
+  } catch (err) {
+    log('ERROR', 'DELETE /playlists/:id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/playlists/:id/items', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const playlistId = parseInt(req.params.id, 10);
+    const mealPlanId = parseInt(req.body?.meal_plan_id, 10);
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    if (isNaN(playlistId) || playlistId < 1 || isNaN(mealPlanId) || mealPlanId < 1) {
+      return res.status(400).json({ error: 'Invalid list or dish.' });
+    }
+    const client = await pool.connect();
+    try {
+      const owned = await client.query(
+        `SELECT p.id FROM playlists p WHERE p.id = $1 AND p.user_id = $2`,
+        [playlistId, user_id]
+      );
+      if (!owned.rows[0]) return res.status(404).json({ error: 'List not found' });
+      const plan = await client.query(
+        'SELECT id FROM meal_plans WHERE id = $1 AND user_id = $2',
+        [mealPlanId, user_id]
+      );
+      if (!plan.rows[0]) return res.status(404).json({ error: 'Dish not found' });
+      const maxOrder = await client.query<{ n: number }>(
+        'SELECT COALESCE(MAX(sort_order), -1)::int AS n FROM playlist_items WHERE playlist_id = $1',
+        [playlistId]
+      );
+      await client.query(
+        `INSERT INTO playlist_items (playlist_id, meal_plan_id, sort_order)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (playlist_id, meal_plan_id) DO NOTHING`,
+        [playlistId, mealPlanId, (maxOrder.rows[0]?.n ?? -1) + 1]
+      );
+      await generateShoppingListForPlaylist(client, playlistId);
+      const playlist = await serializePlaylist(client, playlistId, user_id, { includeTracks: true });
+      res.status(201).json(playlist);
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /playlists/:id/items failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/playlists/:id/items/:planId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const playlistId = parseInt(req.params.id, 10);
+    const mealPlanId = parseInt(req.params.planId, 10);
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    if (isNaN(playlistId) || isNaN(mealPlanId)) return res.status(400).json({ error: 'Invalid list or dish.' });
+    const client = await pool.connect();
+    try {
+      const owned = await client.query(
+        'SELECT id FROM playlists WHERE id = $1 AND user_id = $2',
+        [playlistId, user_id]
+      );
+      if (!owned.rows[0]) return res.status(404).json({ error: 'List not found' });
+      await client.query(
+        'DELETE FROM playlist_items WHERE playlist_id = $1 AND meal_plan_id = $2',
+        [playlistId, mealPlanId]
+      );
+      await generateShoppingListForPlaylist(client, playlistId);
+      const playlist = await serializePlaylist(client, playlistId, user_id, { includeTracks: true });
+      res.json(playlist);
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'DELETE /playlists/:id/items/:planId failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/playlists/:id/items/order', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const playlistId = parseInt(req.params.id, 10);
+    const ids = Array.isArray(req.body?.meal_plan_ids) ? req.body.meal_plan_ids.map((n: unknown) => parseInt(String(n), 10)) : [];
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    if (isNaN(playlistId) || playlistId < 1) return res.status(400).json({ error: 'Invalid list id.' });
+    if (!ids.length || ids.some((n: number) => isNaN(n) || n < 1)) {
+      return res.status(400).json({ error: 'meal_plan_ids must be a non-empty array.' });
+    }
+    const client = await pool.connect();
+    try {
+      const owned = await client.query(
+        'SELECT id FROM playlists WHERE id = $1 AND user_id = $2',
+        [playlistId, user_id]
+      );
+      if (!owned.rows[0]) return res.status(404).json({ error: 'List not found' });
+      for (let i = 0; i < ids.length; i++) {
+        await client.query(
+          'UPDATE playlist_items SET sort_order = $1 WHERE playlist_id = $2 AND meal_plan_id = $3',
+          [i, playlistId, ids[i]]
+        );
+      }
+      const playlist = await serializePlaylist(client, playlistId, user_id, { includeTracks: true });
+      res.json(playlist);
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'PUT /playlists/:id/items/order failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/playlists/:id/share', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const playlistId = parseInt(req.params.id, 10);
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    if (isNaN(playlistId) || playlistId < 1) return res.status(400).json({ error: 'Invalid list id.' });
+
+    const existing = await pool.query(
+      `SELECT id, title, is_public, share_slug FROM playlists WHERE id = $1 AND user_id = $2`,
+      [playlistId, user_id]
+    );
+    if (!existing.rows[0]) return res.status(404).json({ error: 'List not found' });
+
+    let shareSlug = existing.rows[0].share_slug as string | null;
+    if (!shareSlug) {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const candidate = makeShareSlug();
+        try {
+          const updated = await pool.query(
+            `UPDATE playlists
+             SET is_public = TRUE, share_slug = $1, shared_at = CURRENT_TIMESTAMP
+             WHERE id = $2 AND user_id = $3
+             RETURNING share_slug`,
+            [candidate, playlistId, user_id]
+          );
+          shareSlug = updated.rows[0].share_slug;
+          break;
+        } catch (err: unknown) {
+          const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: string }).code : null;
+          if (code !== '23505') throw err;
+        }
+      }
+      if (!shareSlug) return res.status(500).json({ error: 'Could not create share link.' });
+    } else if (!existing.rows[0].is_public) {
+      await pool.query(
+        `UPDATE playlists SET is_public = TRUE, shared_at = CURRENT_TIMESTAMP WHERE id = $1 AND user_id = $2`,
+        [playlistId, user_id]
+      );
+    }
+
+    res.json({
+      id: playlistId,
+      title: existing.rows[0].title,
+      is_public: true,
+      share_slug: shareSlug,
+    });
+  } catch (err) {
+    log('ERROR', 'POST /playlists/:id/share failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/playlists/:id/unshare', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const playlistId = parseInt(req.params.id, 10);
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    if (isNaN(playlistId) || playlistId < 1) return res.status(400).json({ error: 'Invalid list id.' });
+    const result = await pool.query(
+      `UPDATE playlists SET is_public = FALSE WHERE id = $1 AND user_id = $2
+       RETURNING id, title, is_public, share_slug`,
+      [playlistId, user_id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'List not found' });
+    res.json({
+      id: result.rows[0].id,
+      title: result.rows[0].title,
+      is_public: false,
+      share_slug: result.rows[0].share_slug,
+    });
+  } catch (err) {
+    log('ERROR', 'POST /playlists/:id/unshare failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/playlists/:id/shopping-list', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const playlistId = parseInt(req.params.id, 10);
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    if (isNaN(playlistId) || playlistId < 1) return res.status(400).json({ error: 'Invalid list id.' });
+    const client = await pool.connect();
+    try {
+      const owned = await client.query(
+        'SELECT id FROM playlists WHERE id = $1 AND user_id = $2',
+        [playlistId, user_id]
+      );
+      if (!owned.rows[0]) return res.status(404).json({ error: 'List not found' });
+      let list = await loadPlaylistShoppingList(client, playlistId);
+      if (!list) {
+        await generateShoppingListForPlaylist(client, playlistId);
+        list = await loadPlaylistShoppingList(client, playlistId);
+      }
+      res.json(list);
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'GET /playlists/:id/shopping-list failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/playlists/:id/shopping-list/generate', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const playlistId = parseInt(req.params.id, 10);
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    if (isNaN(playlistId) || playlistId < 1) return res.status(400).json({ error: 'Invalid list id.' });
+    const client = await pool.connect();
+    try {
+      const owned = await client.query(
+        'SELECT id FROM playlists WHERE id = $1 AND user_id = $2',
+        [playlistId, user_id]
+      );
+      if (!owned.rows[0]) return res.status(404).json({ error: 'List not found' });
+      await generateShoppingListForPlaylist(client, playlistId);
+      const list = await loadPlaylistShoppingList(client, playlistId);
+      res.json(list);
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /playlists/:id/shopping-list/generate failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.patch('/playlist-list/items/:id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const itemId = parseInt(req.params.id, 10);
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const { checked } = req.body ?? {};
+    if (isNaN(itemId) || itemId < 1) return res.status(400).json({ error: 'Invalid item id.' });
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    if (typeof checked !== 'boolean') return res.status(400).json({ error: 'checked must be a boolean' });
+    const result = await pool.query(
+      `UPDATE playlist_shopping_list_items sli
+       SET checked = $1
+       FROM playlist_shopping_lists sl
+       JOIN playlists p ON p.id = sl.playlist_id
+       WHERE sli.id = $2
+         AND sli.shopping_list_id = sl.id
+         AND p.user_id = $3
+       RETURNING sli.id, sli.checked`,
+      [checked, itemId, user_id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Shopping list item not found' });
+    res.json({ id: result.rows[0].id, checked: result.rows[0].checked });
+  } catch (err) {
+    log('ERROR', 'PATCH /playlist-list/items/:id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/playlists/:id/shopping-list/clear-checks', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    const playlistId = parseInt(req.params.id, 10);
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+    if (isNaN(playlistId) || playlistId < 1) return res.status(400).json({ error: 'Invalid list id.' });
+    const client = await pool.connect();
+    try {
+      const owned = await client.query(
+        'SELECT id FROM playlists WHERE id = $1 AND user_id = $2',
+        [playlistId, user_id]
+      );
+      if (!owned.rows[0]) return res.status(404).json({ error: 'List not found' });
+      const listRow = await client.query<{ id: number }>(
+        'SELECT id FROM playlist_shopping_lists WHERE playlist_id = $1',
+        [playlistId]
+      );
+      if (!listRow.rows[0]) return res.status(404).json({ error: 'Shopping list not found' });
+      await client.query(
+        'UPDATE playlist_shopping_list_items SET checked = FALSE WHERE shopping_list_id = $1',
+        [listRow.rows[0].id]
+      );
+      const list = await loadPlaylistShoppingList(client, playlistId);
+      res.json(list);
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /playlists/:id/shopping-list/clear-checks failed', { err: String(err) });
     res.status(500).json({ error: 'Internal server error' });
   }
 });

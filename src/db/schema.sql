@@ -165,3 +165,51 @@ CREATE TABLE IF NOT EXISTS catalog_recipe_collections (
 
 CREATE INDEX IF NOT EXISTS idx_catalog_recipes_search ON catalog_recipes (search_text);
 CREATE INDEX IF NOT EXISTS idx_catalog_recipe_collections_collection ON catalog_recipe_collections (collection_id);
+
+-- User playlists (Spotify-style lists of saved dishes)
+CREATE TABLE IF NOT EXISTS playlists (
+  id SERIAL PRIMARY KEY,
+  user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(255) NOT NULL,
+  blurb TEXT,
+  kind VARCHAR(20) NOT NULL DEFAULT 'custom',
+  is_public BOOLEAN NOT NULL DEFAULT FALSE,
+  share_slug VARCHAR(32) UNIQUE,
+  shared_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_playlists_user_id ON playlists(user_id);
+CREATE INDEX IF NOT EXISTS idx_playlists_share_slug ON playlists(share_slug) WHERE share_slug IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_user_liked ON playlists(user_id) WHERE kind = 'liked';
+
+CREATE TABLE IF NOT EXISTS playlist_items (
+  playlist_id INT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+  meal_plan_id INT NOT NULL REFERENCES meal_plans(id) ON DELETE CASCADE,
+  sort_order INT NOT NULL DEFAULT 0,
+  added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (playlist_id, meal_plan_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_playlist_items_plan ON playlist_items(meal_plan_id);
+CREATE INDEX IF NOT EXISTS idx_playlist_items_order ON playlist_items(playlist_id, sort_order);
+
+CREATE TABLE IF NOT EXISTS playlist_shopping_lists (
+  id SERIAL PRIMARY KEY,
+  playlist_id INT NOT NULL UNIQUE REFERENCES playlists(id) ON DELETE CASCADE,
+  total_cost DECIMAL(10, 2),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS playlist_shopping_list_items (
+  id SERIAL PRIMARY KEY,
+  shopping_list_id INT NOT NULL REFERENCES playlist_shopping_lists(id) ON DELETE CASCADE,
+  ingredient_name VARCHAR(255) NOT NULL,
+  quantity DECIMAL(10, 3),
+  unit VARCHAR(50),
+  category VARCHAR(100),
+  estimated_price DECIMAL(10, 2),
+  checked BOOLEAN DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_playlist_shop_items_list ON playlist_shopping_list_items(shopping_list_id);
