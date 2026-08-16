@@ -11,7 +11,7 @@ import cors from 'cors';
 import * as fs from 'fs';
 import * as path from 'path';
 import { config, RETAILERS, type Retailer } from './config';
-import { attachRecipeImages, isAllowedImageUrl } from './recipeImages';
+import { isAllowedImageUrl } from './recipeImages';
 
 // Config is validated at import (config.ts); server exits if JWT_SECRET or OPENAI_API_KEY missing.
 
@@ -564,7 +564,6 @@ async function loadRecipesForPlan(client: PoolClient, planId: number) {
       protein: recipe.protein != null ? parseFloat(recipe.protein) : null,
       carbs: recipe.carbs != null ? parseFloat(recipe.carbs) : null,
       fat: recipe.fat != null ? parseFloat(recipe.fat) : null,
-      image: isAllowedImageUrl(recipe.image_url) ? recipe.image_url : null,
       ingredients: ingredientsResult.rows.map((ing) => ({
         ingredient_name: ing.ingredient_name,
         quantity: ing.quantity != null ? parseFloat(ing.quantity) : null,
@@ -633,12 +632,7 @@ async function serializePlaylist(
   if (opts?.includeTracks) {
     const tracks = await client.query(
       `SELECT
-         i.meal_plan_id, i.sort_order, mp.plan_name, mp.servings, mp.total_estimated_cost,
-         (
-           SELECT r.image_url FROM recipes r
-           WHERE r.meal_plan_id = mp.id
-           ORDER BY r.id ASC LIMIT 1
-         ) AS image_url
+         i.meal_plan_id, i.sort_order, mp.plan_name, mp.servings, mp.total_estimated_cost
        FROM playlist_items i
        JOIN meal_plans mp ON mp.id = i.meal_plan_id
        WHERE i.playlist_id = $1
@@ -651,7 +645,6 @@ async function serializePlaylist(
       plan_name: t.plan_name,
       servings: t.servings,
       total_estimated_cost: t.total_estimated_cost != null ? parseFloat(t.total_estimated_cost) : null,
-      image: isAllowedImageUrl(t.image_url) ? t.image_url : null,
     }));
   }
   return playlist;
@@ -1124,21 +1117,16 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
           : assistantText;
       let planForClient = mealPlan;
       if (mealPlan) {
-        try {
-          planForClient = await attachRecipeImages(mealPlan, config.UNSPLASH_ACCESS_KEY);
-        } catch (imgErr) {
-          log('WARN', 'Recipe image lookup failed', { err: String(imgErr) });
-          planForClient = {
-            ...mealPlan,
-            recipes: (mealPlan.recipes || []).map((recipe) => {
-              const rest = { ...recipe };
-              delete rest.image;
-              delete rest.image_query;
-              return rest;
-            }),
-          };
-          delete (planForClient as { image?: string }).image;
-        }
+        planForClient = {
+          ...mealPlan,
+          recipes: (mealPlan.recipes || []).map((recipe) => {
+            const rest = { ...recipe };
+            delete rest.image;
+            delete rest.image_query;
+            return rest;
+          }),
+        };
+        delete (planForClient as { image?: string }).image;
       }
 
       res.json({
@@ -1208,7 +1196,7 @@ app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) =>
         const protein = typeof r.protein === 'number' ? r.protein : null;
         const carbs = typeof r.carbs === 'number' ? r.carbs : null;
         const fat = typeof r.fat === 'number' ? r.fat : null;
-        const imageUrl = isAllowedImageUrl(r.image) ? r.image : null;
+        const imageUrl = null;
 
         totalEstimatedCost += estimatedCost;
 
@@ -1487,7 +1475,6 @@ app.get('/share/list/:slug', async (req: Request, res: Response) => {
           plan_name: track.plan_name,
           servings: track.servings,
           total_estimated_cost: track.total_estimated_cost,
-          image: track.image,
           recipes,
         });
       }
