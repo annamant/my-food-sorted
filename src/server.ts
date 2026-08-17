@@ -57,8 +57,9 @@ STRUCTURED MEAL BRIEF (HARD CONSTRAINTS — NON-NEGOTIABLE):
 - Extra notes: treat as required preferences (e.g. "lots of onions" means the dish should feature onions generously).
 - Pantry items: prefer using them; do not ignore them when the user is cooking from the cupboard.
 - Budget, cook-time, servings, days, cuisines, methods: respect them.
-- Filters are collected in the app. NEVER interview, NEVER ask a questionnaire, NEVER ask follow-up questions before cooking.
-- If something minor is missing, pick a sensible UK weeknight default and cook.
+- The app collects constraints in conversation first, then sends them here as a brief. When intent is suggest, finalize, create, tweak, or search: do NOT interview and do NOT ask follow-up questions.
+- If something minor is missing, pick a sensible UK home-cooking default.
+- WEEK PLANS: if days > 1 or mode is week, SUGGEST three week THEMES (not three single dishes). When cooking/finalizing a week, return one recipe per requested meal slot for EACH day (e.g. 7 dinners). Keep methods concise so the full week fits. Vary cuisine and method across the week. Reuse overlapping ingredients where it helps the shop.
 
 INTENT (from the app — honour it):
 - search: they named a dish, cuisine, or mood. Cook that one recipe now. Do not invent extra constraints they did not state.
@@ -70,6 +71,7 @@ INTENT (from the app — honour it):
 WHEN YOU SUGGEST OPTIONS:
 - Give exactly three genuinely different options that all obey the meal brief.
 - Keep each description to one sentence. Explain the style and appeal, not the full method.
+- If this is a week plan: each option is a week direction (theme, rhythm, and what the week will feel like), still with title, description, reason, and rough cost/nutrition as a typical dinner in that week.
 - Return a short friendly lead-in followed by this fenced JSON:
 \`\`\`json
 {
@@ -161,11 +163,16 @@ function formatMealBrief(brief: Record<string, unknown> | null | undefined): str
   const pantry = list(brief.pantry);
   const avoid = str(brief.avoid);
   const notes = str(brief.notes);
+  const mode = str(brief.mode);
+  const isWeek = mode === 'week' || (days != null && days > 1);
 
+  if (isWeek) lines.push('- This is a WEEK PLAN covering multiple days. Suggest week themes first; when cooking, write one recipe per requested meal for each day.');
+  if (mode === 'recipe') lines.push('- Adapt a recognised classic. Keep it identifiable.');
+  if (mode === 'create') lines.push('- Create a practical home-cooked dish from their idea. Do not ignore what they named.');
   if (servings != null) lines.push(`- People / servings: ${servings}`);
   if (days != null) lines.push(`- Days to cover: ${days}`);
   if (slots.length) lines.push(`- Meals needed: ${slots.join(', ')}`);
-  if (budget != null) lines.push(`- Budget per day (GBP): £${budget}`);
+  if (budget != null && budget > 0) lines.push(`- Budget per day (GBP): £${budget}`);
   if (cook != null) lines.push(`- Max cook time per meal: ${cook} minutes`);
   if (cuisines.length) lines.push(`- Preferred cuisines: ${cuisines.join(', ')}`);
   if (methods.length) lines.push(`- Preferred cooking methods: ${methods.join(', ')}`);
@@ -191,7 +198,8 @@ interface OpenAIChatResponse {
 
 async function callMealPlanningAPI(
   messages: ChatMessage[],
-  systemPrompt: string = MEAL_PLANNING_SYSTEM_PROMPT
+  systemPrompt: string = MEAL_PLANNING_SYSTEM_PROMPT,
+  maxTokens: number = config.OPENAI_MAX_TOKENS
 ): Promise<string> {
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -201,7 +209,7 @@ async function callMealPlanningAPI(
     },
     body: JSON.stringify({
       model: config.OPENAI_MODEL,
-      max_tokens: config.OPENAI_MAX_TOKENS,
+      max_tokens: maxTokens,
       messages: [
         { role: 'system', content: systemPrompt },
         ...messages.map((m) => ({
@@ -407,10 +415,19 @@ function buildSystemPrompt(
   let prompt = MEAL_PLANNING_SYSTEM_PROMPT;
 
   const cleanIntent = typeof intent === 'string' ? intent.trim().toLowerCase() : '';
+  const days = mealBrief && typeof mealBrief === 'object' ? Number(mealBrief.days) : 0;
+  const mode = mealBrief && typeof mealBrief === 'object' && typeof mealBrief.mode === 'string'
+    ? mealBrief.mode.trim().toLowerCase()
+    : '';
+  const isWeek = mode === 'week' || days > 1;
   if (['search', 'create', 'tweak', 'suggest', 'finalize'].includes(cleanIntent)) {
-    prompt += cleanIntent === 'suggest'
-      ? '\n\nACTIVE INTENT: suggest. Present exactly three concise options using the options JSON schema. Do not cook yet.'
-      : `\n\nACTIVE INTENT: ${cleanIntent}. Honour the INTENT rules above. Cook now — do not ask questions.`;
+    if (cleanIntent === 'suggest') {
+      prompt += isWeek
+        ? '\n\nACTIVE INTENT: suggest. Present exactly three WEEK THEMES using the options JSON schema. Do not cook yet. Do not write recipes.'
+        : '\n\nACTIVE INTENT: suggest. Present exactly three concise options using the options JSON schema. Do not cook yet.';
+    } else {
+      prompt += `\n\nACTIVE INTENT: ${cleanIntent}. Honour the INTENT rules above. Cook now — do not ask questions.`;
+    }
   }
 
   const briefBlock = formatMealBrief(mealBrief);
@@ -1099,7 +1116,13 @@ app.post('/chat', authenticateToken, async (req: Request, res: Response) => {
         }
       }
 
-      const assistantText = await callMealPlanningAPI(messages, buildSystemPrompt(prefs, brief, intent));
+      const intentName = String(intent || '').toLowerCase();
+      const days = brief && typeof brief.days === 'number' ? brief.days : Number(brief?.days) || 0;
+      const isWeek = Boolean(brief && (brief.mode === 'week' || days > 1));
+      const tokenBudget = isWeek && intentName === 'finalize'
+        ? Math.max(config.OPENAI_MAX_TOKENS, 8192)
+        : config.OPENAI_MAX_TOKENS;
+      const assistantText = await callMealPlanningAPI(messages, buildSystemPrompt(prefs, brief, intent), tokenBudget);
 
       await client.query(
         'INSERT INTO chat_messages (user_id, sender, message_text, conversation_id) VALUES ($1, $2, $3, $4)',
