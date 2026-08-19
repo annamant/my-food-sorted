@@ -1470,6 +1470,151 @@ app.post('/meal-plan/:id/unshare', authenticateToken, async (req: Request, res: 
   }
 });
 
+function wantsJsonResponse(req: Request) {
+  const accept = String(req.headers.accept || '').toLowerCase()
+  return accept.includes('application/json')
+}
+
+function escapeHtml(value: unknown) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function textToHtmlParagraphs(text: unknown) {
+  const raw = String(text ?? '')
+  // Preserve line breaks (often important for instructions).
+  return escapeHtml(raw).replace(/\n/g, '<br/>')
+}
+
+function getCanonicalUrl(req: Request) {
+  const proto = (req.headers['x-forwarded-proto'] as string) || 'https'
+  const host = (req.headers['x-forwarded-host'] as string) || req.headers.host || 'www.myfoodsorted.com'
+  return `${proto}://${host}${req.originalUrl}`
+}
+
+function renderHtmlDocument({ title, description, canonical, bodyHtml }: { title: string; description: string; canonical: string; bodyHtml: string }) {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${escapeHtml(title)}</title>
+    <meta name="description" content="${escapeHtml(description)}" />
+    <link rel="canonical" href="${escapeHtml(canonical)}" />
+    <meta property="og:title" content="${escapeHtml(title)}" />
+    <meta property="og:description" content="${escapeHtml(description)}" />
+    <meta property="og:type" content="article" />
+    <meta name="twitter:card" content="summary" />
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 0; padding: 32px 16px; color: #111; background: #fff; }
+      main { max-width: 920px; margin: 0 auto; }
+      h1 { font-size: 2rem; margin: 0 0 8px; }
+      h2 { font-size: 1.25rem; margin: 28px 0 6px; }
+      p { line-height: 1.6; margin: 8px 0; }
+      .meta { color: #444; margin: 0 0 16px; font-size: 0.95rem; }
+      .recipe { border-top: 1px solid #eee; padding-top: 16px; }
+      ul { margin: 8px 0 0; padding-left: 18px; }
+      li { margin: 4px 0; }
+      footer { margin-top: 32px; color: #666; font-size: 0.9rem; }
+    </style>
+  </head>
+  <body>
+    <main>
+      ${bodyHtml}
+      <footer>my food. SORTED. Chat, cook, keep the book — then shop with one combined list.</footer>
+    </main>
+  </body>
+</html>`
+}
+
+function renderRecipeCardsHtml(recipes: any[]) {
+  const safeRecipes = Array.isArray(recipes) ? recipes : []
+  return safeRecipes
+    .map((r) => {
+      const title = r?.title ?? 'Untitled recipe'
+      const instructions = r?.instructions ?? ''
+      const ingredients = Array.isArray(r?.ingredients) ? r.ingredients.slice(0, 12) : []
+
+      const ingredientsHtml = ingredients.length
+        ? `<div><strong>Ingredients</strong>
+            <ul>
+              ${ingredients
+                .map((ing: any) => {
+                  const name = ing?.ingredient_name ?? 'ingredient'
+                  const qty = ing?.quantity != null ? String(ing.quantity) : ''
+                  const unit = ing?.unit ? String(ing.unit) : ''
+                  const price = ing?.estimated_price != null ? ` (£${ing.estimated_price})` : ''
+                  const qtyUnit = [qty, unit].filter(Boolean).join(' ')
+                  return `<li>${escapeHtml(name)}${qtyUnit ? ` — ${escapeHtml(qtyUnit)}` : ''}${price}</li>`
+                })
+                .join('')}
+            </ul>
+          </div>`
+        : ''
+
+      return `<section class="recipe">
+        <h2>${escapeHtml(title)}</h2>
+        ${ingredientsHtml}
+        <div><strong>Instructions</strong></div>
+        <p>${textToHtmlParagraphs(instructions)}</p>
+      </section>`
+    })
+    .join('\n')
+}
+
+function renderSharedRecipeHtml(payload: any, canonical: string) {
+  const planName = payload?.plan_name ?? 'A shared recipe'
+  const description = payload?.recipes?.[0]?.title
+    ? `A shared recipe: ${payload.recipes[0].title}`
+    : `A shared recipe from ${planName}`
+
+  const bodyHtml = `<h1>${escapeHtml(planName)}</h1>
+    <p class="meta">
+      ${payload?.servings != null ? `Servings: ${escapeHtml(payload.servings)}` : 'Servings: —'}
+      ${payload?.shared_at ? ` · Shared: ${escapeHtml(payload.shared_at)}` : ''}
+    </p>
+    ${renderRecipeCardsHtml(payload?.recipes)}`
+
+  return renderHtmlDocument({
+    title: `my food. SORTED. — ${String(planName)}`,
+    description,
+    canonical,
+    bodyHtml,
+  })
+}
+
+function renderSharedListHtml(payload: any, canonical: string) {
+  const listTitle = payload?.title ?? 'A shared recipe book'
+  const description = payload?.blurb ? String(payload.blurb) : `A shared list from ${listTitle}`
+
+  const dishes = Array.isArray(payload?.dishes) ? payload.dishes : []
+  const dishesHtml = dishes
+    .map((d: any) => {
+      const header = `<h2>${escapeHtml(d?.plan_name ?? 'Dish')}</h2>
+        <p class="meta">
+          ${d?.servings != null ? `Servings: ${escapeHtml(d.servings)}` : ''}
+          ${d?.total_estimated_cost != null ? ` · Est cost: £${escapeHtml(d.total_estimated_cost)}` : ''}
+        </p>`
+      return `<section class="recipe">${header}${renderRecipeCardsHtml(d?.recipes)}</section>`
+    })
+    .join('\n')
+
+  const bodyHtml = `<h1>${escapeHtml(listTitle)}</h1>
+    <p class="meta">${escapeHtml(description)}</p>
+    ${dishesHtml}`
+
+  return renderHtmlDocument({
+    title: `my food. SORTED. — ${String(listTitle)}`,
+    description,
+    canonical,
+    bodyHtml,
+  })
+}
+
 app.get('/share/list/:slug', async (req: Request, res: Response) => {
   try {
     const slug = String(req.params.slug || '').trim();
@@ -1501,7 +1646,15 @@ app.get('/share/list/:slug', async (req: Request, res: Response) => {
           recipes,
         });
       }
-      res.json({ ...playlist, dishes });
+
+      const payload = { ...playlist, dishes }
+      if (wantsJsonResponse(req)) {
+        return res.json(payload)
+      }
+
+      const canonical = getCanonicalUrl(req)
+      res.setHeader('Content-Type', 'text/html; charset=utf-8')
+      return res.send(renderSharedListHtml(payload, canonical))
     } finally {
       client.release();
     }
@@ -1532,7 +1685,7 @@ app.get('/share/:slug', async (req: Request, res: Response) => {
       const plan = planResult.rows[0];
       const recipes = await loadRecipesForPlan(client, plan.id);
 
-      res.json({
+      const payload = {
         id: plan.id,
         plan_name: plan.plan_name,
         total_estimated_cost: plan.total_estimated_cost != null ? parseFloat(plan.total_estimated_cost) : null,
@@ -1541,7 +1694,15 @@ app.get('/share/:slug', async (req: Request, res: Response) => {
         shared_at: plan.shared_at,
         created_at: plan.created_at,
         recipes,
-      });
+      }
+
+      if (wantsJsonResponse(req)) {
+        return res.json(payload)
+      }
+
+      const canonical = getCanonicalUrl(req)
+      res.setHeader('Content-Type', 'text/html; charset=utf-8')
+      return res.send(renderSharedRecipeHtml(payload, canonical))
     } finally {
       client.release();
     }
