@@ -1490,10 +1490,15 @@ function textToHtmlParagraphs(text: unknown) {
   return escapeHtml(raw).replace(/\n/g, '<br/>')
 }
 
+const SITE_ORIGIN = 'https://www.myfoodsorted.com'
+const OG_IMAGE_URL = `${SITE_ORIGIN}/hero-summer-table.jpg`
+const OG_IMAGE_ALT = 'A bright summer table with salad, grilled fish, vegetables and fresh sides'
+
 function getCanonicalUrl(req: Request) {
-  const proto = (req.headers['x-forwarded-proto'] as string) || 'https'
-  const host = (req.headers['x-forwarded-host'] as string) || req.headers.host || 'www.myfoodsorted.com'
-  return `${proto}://${host}${req.originalUrl}`
+  // Always emit the canonical/preview origin as https://www.myfoodsorted.com,
+  // regardless of which host/worker forwarded the request.
+  const path = String(req.originalUrl || '').split('?')[0]
+  return `${SITE_ORIGIN}${path}`
 }
 
 function renderHtmlDocument({ title, description, canonical, bodyHtml }: { title: string; description: string; canonical: string; bodyHtml: string }) {
@@ -1507,8 +1512,15 @@ function renderHtmlDocument({ title, description, canonical, bodyHtml }: { title
     <link rel="canonical" href="${escapeHtml(canonical)}" />
     <meta property="og:title" content="${escapeHtml(title)}" />
     <meta property="og:description" content="${escapeHtml(description)}" />
+  <meta property="og:url" content="${escapeHtml(canonical)}" />
     <meta property="og:type" content="article" />
-    <meta name="twitter:card" content="summary" />
+  <meta property="og:image" content="${escapeHtml(OG_IMAGE_URL)}" />
+  <meta property="og:image:alt" content="${escapeHtml(OG_IMAGE_ALT)}" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="${escapeHtml(title)}" />
+  <meta name="twitter:description" content="${escapeHtml(description)}" />
+  <meta name="twitter:image" content="${escapeHtml(OG_IMAGE_URL)}" />
+  <meta name="twitter:image:alt" content="${escapeHtml(OG_IMAGE_ALT)}" />
     <style>
       body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 0; padding: 32px 16px; color: #111; background: #fff; }
       main { max-width: 920px; margin: 0 auto; }
