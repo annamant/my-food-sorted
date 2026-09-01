@@ -820,10 +820,8 @@ app.use(helmet({
 }));
 const corsOrigins = config.CORS_ORIGINS === '' || config.CORS_ORIGINS === '*' ? undefined : config.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean);
 app.use(cors(corsOrigins ? { origin: corsOrigins } : {}));
-app.use(express.json({
-  limit: ((req: Request) =>
-    req.method === 'POST' && req.path === '/companion/food-log/photo' ? '8mb' : config.JSON_BODY_LIMIT) as unknown as string,
-}));
+// 8mb to allow food-log photo uploads on any route; safe for this app's scale.
+app.use(express.json({ limit: '8mb' }));
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
