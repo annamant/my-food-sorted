@@ -24,6 +24,13 @@ import {
   serializeMealFeedbackEntry,
   type MealFeedbackRow,
 } from './services/mealFeedback';
+import {
+  FOOD_LOG_PHOTO_PROMPT,
+  FOOD_LOG_PARSE_PROMPT,
+  parseFoodLogResponse,
+  validateFoodLogPhotoInput,
+  type ParsedFoodLog,
+} from './services/foodLogService';
 
 // Config is validated at import (config.ts); server exits if JWT_SECRET or OPENAI_API_KEY missing.
 
@@ -228,6 +235,44 @@ async function callMealPlanningAPI(
           role: m.role,
           content: m.content,
         })),
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`OpenAI API error ${response.status}: ${errText}`);
+  }
+
+  const data = (await response.json()) as OpenAIChatResponse;
+  return data.choices?.[0]?.message?.content ?? '';
+}
+
+async function callVisionFoodLogAPI(
+  systemPrompt: string,
+  imageDataUrl: string,
+  userHint: string,
+  maxTokens: number
+): Promise<string> {
+  const hint = userHint.trim() || 'Estimate calories, protein, carbs, and fat for what is visible in this photo.';
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: config.OPENAI_MODEL,
+      max_tokens: maxTokens,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: hint },
+            { type: 'image_url', image_url: { url: imageDataUrl, detail: 'low' } },
+          ],
+        },
       ],
     }),
   });
@@ -775,7 +820,10 @@ app.use(helmet({
 }));
 const corsOrigins = config.CORS_ORIGINS === '' || config.CORS_ORIGINS === '*' ? undefined : config.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean);
 app.use(cors(corsOrigins ? { origin: corsOrigins } : {}));
-app.use(express.json({ limit: config.JSON_BODY_LIMIT }));
+app.use(express.json({
+  limit: ((req: Request) =>
+    req.method === 'POST' && req.path === '/companion/food-log/photo' ? '8mb' : config.JSON_BODY_LIMIT) as unknown as string,
+}));
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -894,7 +942,9 @@ app.get('/me', authenticateToken, async (req: Request, res: Response) => {
     }
 
     const result = await pool.query(
-      `SELECT email, dietary_preferences, allergies, household_size, default_budget, preferred_retailer, message_count
+      `SELECT email, dietary_preferences, allergies, household_size, default_budget, preferred_retailer, message_count,
+              cooking_skill, cuisines, max_cook_minutes, kitchen_equipment, cooks_for,
+              age_range, sex, activity_level
        FROM users WHERE id = $1`,
       [user_id]
     );
@@ -912,6 +962,14 @@ app.get('/me', authenticateToken, async (req: Request, res: Response) => {
       preferred_retailer: u.preferred_retailer ?? 'tesco',
       message_count: u.message_count ?? 0,
       message_quota: config.MESSAGE_QUOTA_PER_USER,
+      cooking_skill: u.cooking_skill ?? null,
+      cuisines: u.cuisines ?? '',
+      max_cook_minutes: u.max_cook_minutes ?? null,
+      kitchen_equipment: u.kitchen_equipment ?? '',
+      cooks_for: u.cooks_for ?? null,
+      age_range: u.age_range ?? null,
+      sex: u.sex ?? null,
+      activity_level: u.activity_level ?? null,
     });
   } catch (err) {
     log('ERROR', 'GET /me failed', { err: String(err) });
@@ -932,6 +990,14 @@ app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
       household_size,
       default_budget,
       preferred_retailer,
+      cooking_skill,
+      cuisines,
+      max_cook_minutes,
+      kitchen_equipment,
+      cooks_for,
+      age_range,
+      sex,
+      activity_level,
     } = req.body ?? {};
 
     if (household_size !== undefined) {
@@ -955,6 +1021,29 @@ app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
     if (allergies !== undefined && typeof allergies !== 'string') {
       return res.status(400).json({ error: 'allergies must be a string' });
     }
+    if (max_cook_minutes !== undefined && max_cook_minutes !== null) {
+      const m = Number(max_cook_minutes);
+      if (!Number.isFinite(m) || m < 5 || m > 240) {
+        return res.status(400).json({ error: 'max_cook_minutes must be between 5 and 240' });
+      }
+    }
+    for (const [field, allowed] of [
+      ['cooking_skill', ['beginner', 'confident', 'advanced']],
+      ['age_range', ['under_18', '18_30', '31_50', '51_65', 'over_65']],
+      ['sex', ['female', 'male', 'other', 'prefer_not_to_say']],
+      ['activity_level', ['low', 'moderate', 'active', 'very_active']],
+    ] as Array<[string, readonly string[]]>) {
+      const value = req.body?.[field];
+      if (value !== undefined && value !== null && !allowed.includes(String(value))) {
+        return res.status(400).json({ error: `${field} is invalid` });
+      }
+    }
+    for (const field of ['cuisines', 'kitchen_equipment', 'cooks_for'] as const) {
+      const value = req.body?.[field];
+      if (value !== undefined && value !== null && typeof value !== 'string') {
+        return res.status(400).json({ error: `${field} must be a string` });
+      }
+    }
 
     const result = await pool.query(
       `UPDATE users SET
@@ -962,9 +1051,19 @@ app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
          allergies = COALESCE($3, allergies),
          household_size = COALESCE($4, household_size),
          default_budget = CASE WHEN $5::boolean THEN $6 ELSE default_budget END,
-         preferred_retailer = COALESCE($7, preferred_retailer)
+         preferred_retailer = COALESCE($7, preferred_retailer),
+         cooking_skill = COALESCE($8, cooking_skill),
+         cuisines = COALESCE($9, cuisines),
+         max_cook_minutes = CASE WHEN $10::boolean THEN $11 ELSE max_cook_minutes END,
+         kitchen_equipment = COALESCE($12, kitchen_equipment),
+         cooks_for = COALESCE($13, cooks_for),
+         age_range = COALESCE($14, age_range),
+         sex = COALESCE($15, sex),
+         activity_level = COALESCE($16, activity_level)
        WHERE id = $1
-       RETURNING email, dietary_preferences, allergies, household_size, default_budget, preferred_retailer, message_count`,
+       RETURNING email, dietary_preferences, allergies, household_size, default_budget, preferred_retailer, message_count,
+                 cooking_skill, cuisines, max_cook_minutes, kitchen_equipment, cooks_for,
+                 age_range, sex, activity_level`,
       [
         user_id,
         dietary_preferences !== undefined ? String(dietary_preferences).slice(0, 2000) : null,
@@ -973,6 +1072,15 @@ app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
         default_budget !== undefined,
         default_budget === null ? null : default_budget,
         preferred_retailer !== undefined ? preferred_retailer.toLowerCase() : null,
+        cooking_skill !== undefined ? cooking_skill : null,
+        cuisines !== undefined ? String(cuisines).slice(0, 2000) : null,
+        max_cook_minutes !== undefined,
+        max_cook_minutes === null ? null : Math.round(Number(max_cook_minutes)),
+        kitchen_equipment !== undefined ? String(kitchen_equipment).slice(0, 2000) : null,
+        cooks_for !== undefined ? String(cooks_for).slice(0, 200) : null,
+        age_range !== undefined ? age_range : null,
+        sex !== undefined ? sex : null,
+        activity_level !== undefined ? activity_level : null,
       ]
     );
 
@@ -990,6 +1098,14 @@ app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
       preferred_retailer: u.preferred_retailer ?? 'tesco',
       message_count: u.message_count ?? 0,
       message_quota: config.MESSAGE_QUOTA_PER_USER,
+      cooking_skill: u.cooking_skill ?? null,
+      cuisines: u.cuisines ?? '',
+      max_cook_minutes: u.max_cook_minutes ?? null,
+      kitchen_equipment: u.kitchen_equipment ?? '',
+      cooks_for: u.cooks_for ?? null,
+      age_range: u.age_range ?? null,
+      sex: u.sex ?? null,
+      activity_level: u.activity_level ?? null,
     });
   } catch (err) {
     log('ERROR', 'PATCH /me failed', { err: String(err) });
@@ -2607,8 +2723,427 @@ app.get('/companion/recent', authenticateToken, async (req: Request, res: Respon
 });
 
 // ---------------------------------------------------------------------------
+// Food log (journal — photo + text "what I ate/cooked")
+// ---------------------------------------------------------------------------
+
+function parseFoodLogDayRange(from: unknown, to: unknown): { from: Date; to: Date } | null {
+  if (typeof from !== 'string' || typeof to !== 'string') return null;
+  const fromDate = new Date(from);
+  const toDate = new Date(to);
+  if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime())) return null;
+  if (toDate < fromDate) return null;
+  return { from: fromDate, to: toDate };
+}
+
+function roundOptionalMacro(value: unknown): number | null {
+  if (value == null) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(n);
+}
+
+function serializeFoodLog(row: {
+  id: number;
+  logged_at: Date;
+  description: string;
+  items: unknown;
+  estimated_protein_g: number | string | null;
+  estimated_calories?: number | string | null;
+  estimated_carbs_g?: number | string | null;
+  estimated_fat_g?: number | string | null;
+  coach_note: string | null;
+  meal_plan_id: number | null;
+  recipe_title: string | null;
+  source: string | null;
+  plan_name?: string | null;
+}) {
+  return {
+    id: row.id,
+    logged_at: row.logged_at,
+    description: row.description,
+    items: Array.isArray(row.items) ? row.items : [],
+    estimated_protein_g:
+      row.estimated_protein_g != null ? Math.round(Number(row.estimated_protein_g)) : null,
+    estimated_calories: roundOptionalMacro(row.estimated_calories),
+    estimated_carbs_g: roundOptionalMacro(row.estimated_carbs_g),
+    estimated_fat_g: roundOptionalMacro(row.estimated_fat_g),
+    coach_note: row.coach_note,
+    meal_plan_id: row.meal_plan_id,
+    recipe_title: row.recipe_title,
+    plan_name: row.plan_name ?? null,
+    source: row.source ?? 'text',
+  };
+}
+
+app.get('/companion/food-log', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const range = parseFoodLogDayRange(req.query.from, req.query.to);
+    if (!range) {
+      return res.status(400).json({ error: 'from and to ISO timestamps are required' });
+    }
+
+    const logsResult = await pool.query(
+      `SELECT fl.id, fl.logged_at, fl.description, fl.items, fl.estimated_protein_g,
+              fl.estimated_calories, fl.estimated_carbs_g, fl.estimated_fat_g,
+              fl.coach_note, fl.meal_plan_id, fl.recipe_title, fl.source, mp.plan_name
+       FROM food_logs fl
+       LEFT JOIN meal_plans mp ON mp.id = fl.meal_plan_id
+       WHERE fl.user_id = $1 AND fl.logged_at >= $2 AND fl.logged_at <= $3
+       ORDER BY fl.logged_at DESC, fl.id DESC`,
+      [user_id, range.from.toISOString(), range.to.toISOString()]
+    );
+
+    const sumResult = await pool.query<{ daily_total: string }>(
+      `SELECT COALESCE(SUM(estimated_calories), 0) AS daily_total
+       FROM food_logs
+       WHERE user_id = $1 AND logged_at >= $2 AND logged_at <= $3`,
+      [user_id, range.from.toISOString(), range.to.toISOString()]
+    );
+
+    res.json({
+      logs: logsResult.rows.map((row) => serializeFoodLog(row)),
+      summary: {
+        daily_calories: Math.round(Number(sumResult.rows[0]?.daily_total ?? 0)),
+      },
+    });
+  } catch (err) {
+    log('ERROR', 'GET /companion/food-log failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 404 & Error Handlers
 // ---------------------------------------------------------------------------
+
+app.post('/companion/food-log/photo', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const { image_base64, mime_type, notes, meal_plan_id, recipe_title, logged_at, from, to } = req.body ?? {};
+
+    let photoInput: { base64: string; mime: string };
+    try {
+      photoInput = validateFoodLogPhotoInput(image_base64, mime_type);
+    } catch (validationErr) {
+      const msg = validationErr instanceof Error ? validationErr.message : 'Invalid image';
+      return res.status(400).json({ error: msg });
+    }
+
+    const userNotes = typeof notes === 'string' ? notes.trim().slice(0, 500) : '';
+
+    const range = parseFoodLogDayRange(from, to);
+    if (!range) {
+      return res.status(400).json({ error: 'from and to ISO timestamps are required' });
+    }
+
+    let linkedPlanId: number | null = null;
+    if (meal_plan_id != null) {
+      const parsed = Number(meal_plan_id);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        return res.status(400).json({ error: 'Invalid meal_plan_id' });
+      }
+      linkedPlanId = parsed;
+    }
+
+    const linkedRecipeTitle =
+      typeof recipe_title === 'string' && recipe_title.trim()
+        ? recipe_title.trim().slice(0, 500)
+        : null;
+
+    let loggedAt = new Date();
+    if (logged_at != null) {
+      const parsedLoggedAt = new Date(logged_at);
+      if (Number.isNaN(parsedLoggedAt.getTime())) {
+        return res.status(400).json({ error: 'Invalid logged_at' });
+      }
+      loggedAt = parsedLoggedAt;
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const quotaResult = await client.query<{ companion_message_count: number }>(
+        `UPDATE users SET companion_message_count = companion_message_count + 1
+         WHERE id = $1 AND companion_message_count < $2
+         RETURNING companion_message_count`,
+        [user_id, config.COMPANION_MESSAGE_QUOTA_PER_USER]
+      );
+      if (quotaResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(429).json({
+          error: `You have reached your ${config.COMPANION_MESSAGE_QUOTA_PER_USER} journal messages limit`,
+        });
+      }
+
+      if (linkedPlanId != null) {
+        const ownedPlan = await client.query(
+          'SELECT id FROM meal_plans WHERE id = $1 AND user_id = $2',
+          [linkedPlanId, user_id]
+        );
+        if (!ownedPlan.rows[0]) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({ error: 'Meal plan not found' });
+        }
+      }
+
+      const imageDataUrl = `data:${photoInput.mime};base64,${photoInput.base64}`;
+      const rawParsed = await callVisionFoodLogAPI(
+        FOOD_LOG_PHOTO_PROMPT,
+        imageDataUrl,
+        userNotes || 'Estimate calories, protein, carbs, and fat for what is visible in this photo.',
+        Math.min(config.OPENAI_MAX_TOKENS, 800)
+      );
+      const parsed: ParsedFoodLog = parseFoodLogResponse(rawParsed);
+
+      let logDescription = parsed.description?.trim() || 'Meal from photo';
+      if (userNotes) {
+        logDescription = `${logDescription}. Notes: ${userNotes}`;
+      }
+
+      const inserted = await client.query(
+        `INSERT INTO food_logs (
+           user_id, logged_at, description, items, estimated_protein_g,
+           estimated_calories, estimated_carbs_g, estimated_fat_g,
+           coach_note, meal_plan_id, recipe_title, source
+         )
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, 'photo')
+         RETURNING id, logged_at, description, items, estimated_protein_g,
+                   estimated_calories, estimated_carbs_g, estimated_fat_g,
+                   coach_note, meal_plan_id, recipe_title, source`,
+        [
+          user_id,
+          loggedAt.toISOString(),
+          logDescription.slice(0, 4000),
+          JSON.stringify(parsed.items),
+          parsed.estimated_protein_g,
+          parsed.estimated_calories,
+          parsed.estimated_carbs_g,
+          parsed.estimated_fat_g,
+          parsed.coach_note,
+          linkedPlanId,
+          linkedRecipeTitle,
+        ]
+      );
+
+      await client.query('COMMIT');
+
+      let planName: string | null = null;
+      if (linkedPlanId != null) {
+        const planRow = await client.query<{ plan_name: string | null }>(
+          'SELECT plan_name FROM meal_plans WHERE id = $1',
+          [linkedPlanId]
+        );
+        planName = planRow.rows[0]?.plan_name ?? null;
+      }
+
+      const sumResult = await pool.query<{ daily_total: string }>(
+        `SELECT COALESCE(SUM(estimated_calories), 0) AS daily_total
+         FROM food_logs
+         WHERE user_id = $1 AND logged_at >= $2 AND logged_at <= $3`,
+        [user_id, range.from.toISOString(), range.to.toISOString()]
+      );
+
+      res.json({
+        log: serializeFoodLog({ ...inserted.rows[0], plan_name: planName }),
+        summary: {
+          daily_calories: Math.round(Number(sumResult.rows[0]?.daily_total ?? 0)),
+        },
+        companion_message_count: quotaResult.rows[0].companion_message_count,
+        companion_message_quota: config.COMPANION_MESSAGE_QUOTA_PER_USER,
+      });
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /companion/food-log/photo failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/companion/food-log/:id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const logId = parseInt(req.params.id, 10);
+    if (isNaN(logId) || logId < 1) {
+      return res.status(400).json({ error: 'Invalid log id' });
+    }
+
+    const { from, to } = req.body ?? {};
+    const range = parseFoodLogDayRange(from, to);
+
+    const result = await pool.query(
+      'DELETE FROM food_logs WHERE id = $1 AND user_id = $2 RETURNING id',
+      [logId, user_id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Log not found' });
+
+    let summary = null;
+    if (range) {
+      const sumResult = await pool.query<{ daily_total: string }>(
+        `SELECT COALESCE(SUM(estimated_calories), 0) AS daily_total
+         FROM food_logs
+         WHERE user_id = $1 AND logged_at >= $2 AND logged_at <= $3`,
+        [user_id, range.from.toISOString(), range.to.toISOString()]
+      );
+      summary = { daily_calories: Math.round(Number(sumResult.rows[0]?.daily_total ?? 0)) };
+    }
+
+    res.json({ ok: true, summary });
+  } catch (err) {
+    log('ERROR', 'DELETE /companion/food-log/:id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/companion/food-log', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const { description, meal_plan_id, recipe_title, logged_at, from, to } = req.body ?? {};
+    if (typeof description !== 'string' || !description.trim()) {
+      return res.status(400).json({ error: 'description is required' });
+    }
+    if (description.trim().length > 4000) {
+      return res.status(400).json({ error: 'Description is too long' });
+    }
+
+    const range = parseFoodLogDayRange(from, to);
+    if (!range) {
+      return res.status(400).json({ error: 'from and to ISO timestamps are required' });
+    }
+
+    let linkedPlanId: number | null = null;
+    if (meal_plan_id != null) {
+      const parsed = Number(meal_plan_id);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        return res.status(400).json({ error: 'Invalid meal_plan_id' });
+      }
+      linkedPlanId = parsed;
+    }
+
+    const linkedRecipeTitle =
+      typeof recipe_title === 'string' && recipe_title.trim()
+        ? recipe_title.trim().slice(0, 500)
+        : null;
+
+    let loggedAt = new Date();
+    if (logged_at != null) {
+      const parsedLoggedAt = new Date(logged_at);
+      if (Number.isNaN(parsedLoggedAt.getTime())) {
+        return res.status(400).json({ error: 'Invalid logged_at' });
+      }
+      loggedAt = parsedLoggedAt;
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const quotaResult = await client.query<{ companion_message_count: number }>(
+        `UPDATE users SET companion_message_count = companion_message_count + 1
+         WHERE id = $1 AND companion_message_count < $2
+         RETURNING companion_message_count`,
+        [user_id, config.COMPANION_MESSAGE_QUOTA_PER_USER]
+      );
+      if (quotaResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(429).json({
+          error: `You have reached your ${config.COMPANION_MESSAGE_QUOTA_PER_USER} journal messages limit`,
+        });
+      }
+
+      if (linkedPlanId != null) {
+        const ownedPlan = await client.query(
+          'SELECT id FROM meal_plans WHERE id = $1 AND user_id = $2',
+          [linkedPlanId, user_id]
+        );
+        if (!ownedPlan.rows[0]) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({ error: 'Meal plan not found' });
+        }
+      }
+
+      const rawParsed = await callMealPlanningAPI(
+        [{ role: 'user', content: description.trim() }],
+        FOOD_LOG_PARSE_PROMPT,
+        Math.min(config.OPENAI_MAX_TOKENS, 800)
+      );
+      const parsed: ParsedFoodLog = parseFoodLogResponse(rawParsed);
+
+      const inserted = await client.query(
+        `INSERT INTO food_logs (
+           user_id, logged_at, description, items, estimated_protein_g,
+           estimated_calories, estimated_carbs_g, estimated_fat_g,
+           coach_note, meal_plan_id, recipe_title, source
+         )
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, 'text')
+         RETURNING id, logged_at, description, items, estimated_protein_g,
+                   estimated_calories, estimated_carbs_g, estimated_fat_g,
+                   coach_note, meal_plan_id, recipe_title, source`,
+        [
+          user_id,
+          loggedAt.toISOString(),
+          description.trim(),
+          JSON.stringify(parsed.items),
+          parsed.estimated_protein_g,
+          parsed.estimated_calories,
+          parsed.estimated_carbs_g,
+          parsed.estimated_fat_g,
+          parsed.coach_note,
+          linkedPlanId,
+          linkedRecipeTitle,
+        ]
+      );
+
+      await client.query('COMMIT');
+
+      let planName: string | null = null;
+      if (linkedPlanId != null) {
+        const planRow = await client.query<{ plan_name: string | null }>(
+          'SELECT plan_name FROM meal_plans WHERE id = $1',
+          [linkedPlanId]
+        );
+        planName = planRow.rows[0]?.plan_name ?? null;
+      }
+
+      const sumResult = await pool.query<{ daily_total: string }>(
+        `SELECT COALESCE(SUM(estimated_calories), 0) AS daily_total
+         FROM food_logs
+         WHERE user_id = $1 AND logged_at >= $2 AND logged_at <= $3`,
+        [user_id, range.from.toISOString(), range.to.toISOString()]
+      );
+
+      res.json({
+        log: serializeFoodLog({ ...inserted.rows[0], plan_name: planName }),
+        summary: {
+          daily_calories: Math.round(Number(sumResult.rows[0]?.daily_total ?? 0)),
+        },
+        companion_message_count: quotaResult.rows[0].companion_message_count,
+        companion_message_quota: config.COMPANION_MESSAGE_QUOTA_PER_USER,
+      });
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /companion/food-log failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 app.use((_req: Request, res: Response) => {
   res.status(404).json({ error: 'Not found' });

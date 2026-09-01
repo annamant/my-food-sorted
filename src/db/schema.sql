@@ -18,6 +18,18 @@ CREATE TABLE IF NOT EXISTS users (
 -- Existing databases: add preferred_retailer if missing
 ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_retailer VARCHAR(50) DEFAULT 'tesco';
 
+-- Structured cooking profile (generalist)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS cooking_skill VARCHAR(20);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS cuisines TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS max_cook_minutes INT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS kitchen_equipment TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS cooks_for VARCHAR(100);
+
+-- Light body info (generalist — no medication, no weight-loss targeting)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS age_range VARCHAR(20);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS sex VARCHAR(20);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS activity_level VARCHAR(20);
+
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
 
@@ -238,3 +250,23 @@ ALTER TABLE meal_feedback ALTER COLUMN feedback DROP NOT NULL;
 
 -- Companion chat + private journal
 ALTER TABLE users ADD COLUMN IF NOT EXISTS companion_message_count INT DEFAULT 0;
+
+-- Food logs (generalist journal — photo + text "what I ate/cooked")
+CREATE TABLE IF NOT EXISTS food_logs (
+  id SERIAL PRIMARY KEY,
+  user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  logged_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  description TEXT NOT NULL,
+  items JSONB,
+  estimated_protein_g NUMERIC,
+  estimated_calories NUMERIC,
+  estimated_carbs_g NUMERIC,
+  estimated_fat_g NUMERIC,
+  coach_note TEXT,
+  meal_plan_id INT REFERENCES meal_plans(id) ON DELETE SET NULL,
+  recipe_title TEXT,
+  source VARCHAR(20) DEFAULT 'text',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_food_logs_user_logged ON food_logs(user_id, logged_at DESC);
