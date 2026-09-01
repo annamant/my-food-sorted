@@ -942,7 +942,7 @@ app.get('/me', authenticateToken, async (req: Request, res: Response) => {
     const result = await pool.query(
       `SELECT email, dietary_preferences, allergies, household_size, default_budget, preferred_retailer, message_count,
               cooking_skill, cuisines, max_cook_minutes, kitchen_equipment, cooks_for,
-              age_range, sex, activity_level
+              age_range, sex, activity_level, weight_kg
        FROM users WHERE id = $1`,
       [user_id]
     );
@@ -968,6 +968,7 @@ app.get('/me', authenticateToken, async (req: Request, res: Response) => {
       age_range: u.age_range ?? null,
       sex: u.sex ?? null,
       activity_level: u.activity_level ?? null,
+      weight_kg: u.weight_kg != null ? parseFloat(u.weight_kg) : null,
     });
   } catch (err) {
     log('ERROR', 'GET /me failed', { err: String(err) });
@@ -996,6 +997,7 @@ app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
       age_range,
       sex,
       activity_level,
+      weight_kg,
     } = req.body ?? {};
 
     if (household_size !== undefined) {
@@ -1023,6 +1025,12 @@ app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
       const m = Number(max_cook_minutes);
       if (!Number.isFinite(m) || m < 5 || m > 240) {
         return res.status(400).json({ error: 'max_cook_minutes must be between 5 and 240' });
+      }
+    }
+    if (weight_kg !== undefined && weight_kg !== null) {
+      const w = Number(weight_kg);
+      if (!Number.isFinite(w) || w < 30 || w > 300) {
+        return res.status(400).json({ error: 'weight_kg must be between 30 and 300' });
       }
     }
     for (const [field, allowed] of [
@@ -1057,11 +1065,12 @@ app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
          cooks_for = COALESCE($13, cooks_for),
          age_range = COALESCE($14, age_range),
          sex = COALESCE($15, sex),
-         activity_level = COALESCE($16, activity_level)
+         activity_level = COALESCE($16, activity_level),
+         weight_kg = CASE WHEN $17::boolean THEN $18 ELSE weight_kg END
        WHERE id = $1
        RETURNING email, dietary_preferences, allergies, household_size, default_budget, preferred_retailer, message_count,
                  cooking_skill, cuisines, max_cook_minutes, kitchen_equipment, cooks_for,
-                 age_range, sex, activity_level`,
+                 age_range, sex, activity_level, weight_kg`,
       [
         user_id,
         dietary_preferences !== undefined ? String(dietary_preferences).slice(0, 2000) : null,
@@ -1079,6 +1088,8 @@ app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
         age_range !== undefined ? age_range : null,
         sex !== undefined ? sex : null,
         activity_level !== undefined ? activity_level : null,
+        weight_kg !== undefined,
+        weight_kg === null ? null : Math.round(Number(weight_kg) * 10) / 10,
       ]
     );
 
@@ -1104,6 +1115,7 @@ app.patch('/me', authenticateToken, async (req: Request, res: Response) => {
       age_range: u.age_range ?? null,
       sex: u.sex ?? null,
       activity_level: u.activity_level ?? null,
+      weight_kg: u.weight_kg != null ? parseFloat(u.weight_kg) : null,
     });
   } catch (err) {
     log('ERROR', 'PATCH /me failed', { err: String(err) });
