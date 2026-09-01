@@ -1978,11 +1978,107 @@ app.get('/share/:slug', async (req: Request, res: Response) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Discover & leaderboard (public community content)
+// ---------------------------------------------------------------------------
+
+function creatorDisplayFromEmail(email: string): string {
+  const local = String(email || '').split('@')[0] || 'someone';
+  const cleaned = local.replace(/[._-]+/g, ' ').trim();
+  if (!cleaned) return 'someone';
+  return cleaned.split(/\s+/).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
+
+app.get('/discover/recipes', async (_req: Request, res: Response) => {
+  try {
+    const result = await pool.query(
+      `SELECT mp.id, mp.plan_name, mp.share_slug, mp.servings, mp.shared_at,
+              u.email,
+              r.title AS recipe_title, r.calories, r.prep_time, r.cook_time
+       FROM meal_plans mp
+       JOIN users u ON u.id = mp.user_id
+       LEFT JOIN LATERAL (
+         SELECT title, calories, prep_time, cook_time
+         FROM recipes
+         WHERE meal_plan_id = mp.id
+         ORDER BY id ASC
+         LIMIT 1
+       ) r ON TRUE
+       WHERE mp.is_public = TRUE AND mp.share_slug IS NOT NULL
+       ORDER BY mp.shared_at DESC NULLS LAST, mp.created_at DESC
+       LIMIT 40`
+    );
+
+    res.json({
+      recipes: result.rows.map((row: any) => ({
+        id: row.id,
+        plan_name: row.plan_name,
+        share_slug: row.share_slug,
+        servings: row.servings,
+        shared_at: row.shared_at,
+        owner_display: creatorDisplayFromEmail(row.email),
+        recipes: row.recipe_title
+          ? [{
+              title: row.recipe_title,
+              calories: row.calories,
+              prep_time: row.prep_time,
+              cook_time: row.cook_time,
+            }]
+          : [],
+      })),
+    });
+  } catch (err) {
+    log('ERROR', 'GET /discover/recipes failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+async function loadDiscoverBooks() {
+  const result = await pool.query(
+    `SELECT p.id, p.title, p.share_slug, p.created_at, u.email,
+            (SELECT COUNT(*)::int FROM playlist_items pi WHERE pi.playlist_id = p.id) AS tracks_count
+     FROM playlists p
+     JOIN users u ON u.id = p.user_id
+     WHERE p.is_public = TRUE AND p.share_slug IS NOT NULL AND p.kind <> 'liked'
+     ORDER BY p.shared_at DESC NULLS LAST, p.created_at DESC
+     LIMIT 20`
+  );
+
+  return result.rows.map((row: any, index: number) => ({
+    id: row.id,
+    title: row.title,
+    share_slug: row.share_slug,
+    rank: index + 1,
+    tracks_count: row.tracks_count,
+    dishes_count: row.tracks_count,
+    owner_display: creatorDisplayFromEmail(row.email),
+  }));
+}
+
+app.get('/discover/books', async (_req: Request, res: Response) => {
+  try {
+    const books = await loadDiscoverBooks();
+    res.json({ books, entries: books });
+  } catch (err) {
+    log('ERROR', 'GET /discover/books failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/leaderboard', async (_req: Request, res: Response) => {
+  try {
+    const entries = await loadDiscoverBooks();
+    res.json({ entries });
+  } catch (err) {
+    log('ERROR', 'GET /leaderboard failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.get('/playlists', authenticateToken, async (req: Request, res: Response) => {
   try {
     const user_id = (req as AuthenticatedRequest).user?.userId;
-    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
-    const client = await pool.connect();
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });    const client = await pool.connect();
     try {
       await ensureLikedPlaylist(client, user_id);
       const rows = await client.query<{ id: number }>(
