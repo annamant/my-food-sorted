@@ -30,7 +30,7 @@ export const config = {
   JSON_BODY_LIMIT: optionalEnv('JSON_BODY_LIMIT', '50kb'),
 
   /** Message limit per user before 429 (reset not implemented; consider daily reset later). */
-  MESSAGE_QUOTA_PER_USER: parseInt(optionalEnv('MESSAGE_QUOTA_PER_USER', '50'), 10),
+  MESSAGE_QUOTA_PER_USER: parseInt(optionalEnv('MESSAGE_QUOTA_PER_USER', '200'), 10),
 
   /** Companion / journal chat limit (separate from kitchen planner quota). */
   COMPANION_MESSAGE_QUOTA_PER_USER: parseInt(optionalEnv('COMPANION_MESSAGE_QUOTA_PER_USER', '100'), 10),
