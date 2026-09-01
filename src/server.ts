@@ -5,7 +5,7 @@ import crypto from 'crypto';
 import express, { Request, Response, NextFunction } from 'express';
 import { rateLimit } from 'express-rate-limit';
 import helmet from 'helmet';
-import { authenticateToken, AuthenticatedRequest } from './middleware/auth';
+import { authenticateToken, requireAdmin, AuthenticatedRequest } from './middleware/auth';
 import { Pool, PoolClient } from 'pg';
 import cors from 'cors';
 import * as fs from 'fs';
@@ -31,6 +31,7 @@ import {
   validateFoodLogPhotoInput,
   type ParsedFoodLog,
 } from './services/foodLogService';
+import { loadCohortSummary } from './services/cohortSummary';
 
 // Config is validated at import (config.ts); server exits if JWT_SECRET or OPENAI_API_KEY missing.
 
@@ -3364,6 +3365,20 @@ app.delete('/companion/journal/:id', authenticateToken, async (req: Request, res
     res.json({ ok: true });
   } catch (err) {
     log('ERROR', 'DELETE /companion/journal/:id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Admin cohort (founder-only snapshot of aggregate activity)
+// ---------------------------------------------------------------------------
+
+app.get('/admin/cohort', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const summary = await loadCohortSummary(pool, req.query.days);
+    res.json(summary);
+  } catch (err) {
+    log('ERROR', 'GET /admin/cohort failed', { err: String(err) });
     res.status(500).json({ error: 'Internal server error' });
   }
 });

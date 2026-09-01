@@ -27,3 +27,43 @@ export function authenticateToken(
     next();
   });
 }
+
+function founderEmailMatches(email: unknown, expected: string): boolean {
+  const a = String(email ?? '').trim().toLowerCase();
+  const b = String(expected ?? '').trim().toLowerCase();
+  return Boolean(a) && Boolean(b) && a === b;
+}
+
+/**
+ * Founder-only. Accepts a logged-in JWT for ADMIN_EMAIL.
+ * Unknown callers get 404 so the route is not advertised.
+ */
+export function requireAdmin(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+) {
+  const adminEmail = config.ADMIN_EMAIL;
+  if (!adminEmail) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+
+  const authHeader = req.headers['authorization'];
+  const bearer = typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : '';
+
+  if (bearer) {
+    try {
+      const decoded = jwt.verify(bearer, config.JWT_SECRET) as JwtPayload;
+      if (founderEmailMatches(decoded?.email, adminEmail)) {
+        req.user = decoded;
+        return next();
+      }
+    } catch {
+      // not a user session
+    }
+  }
+
+  return res.status(404).json({ error: 'Not found' });
+}

@@ -44,6 +44,9 @@ export const config = {
 
   /** UTM source tag appended to retailer affiliate links. */
   UTM_SOURCE: optionalEnv('UTM_SOURCE', 'my-food-sorted'),
+
+  /** Founder email allowed to view the admin cohort snapshot. */
+  ADMIN_EMAIL: optionalEnv('ADMIN_EMAIL', ''),
 } as const;
 
 /** Retailers supported for affiliate links. */
