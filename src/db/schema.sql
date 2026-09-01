@@ -213,3 +213,28 @@ CREATE TABLE IF NOT EXISTS playlist_shopping_list_items (
 );
 
 CREATE INDEX IF NOT EXISTS idx_playlist_shop_items_list ON playlist_shopping_list_items(shopping_list_id);
+
+-- Meal feedback (generalist matching engine learning loop)
+CREATE TABLE IF NOT EXISTS meal_feedback (
+  id SERIAL PRIMARY KEY,
+  user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  feedback_key TEXT NOT NULL,
+  feedback VARCHAR(32),
+  repeat VARCHAR(32),
+  plan_id INT REFERENCES meal_plans(id) ON DELETE SET NULL,
+  recipe_title TEXT,
+  day_label TEXT,
+  meal_slot TEXT,
+  calories NUMERIC,
+  recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, feedback_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_meal_feedback_user_id ON meal_feedback(user_id);
+CREATE INDEX IF NOT EXISTS idx_meal_feedback_feedback ON meal_feedback(feedback);
+CREATE INDEX IF NOT EXISTS idx_meal_feedback_recorded_at ON meal_feedback(recorded_at);
+
+ALTER TABLE meal_feedback ALTER COLUMN feedback DROP NOT NULL;
+
+-- Companion chat + private journal
+ALTER TABLE users ADD COLUMN IF NOT EXISTS companion_message_count INT DEFAULT 0;

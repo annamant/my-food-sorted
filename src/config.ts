@@ -32,6 +32,9 @@ export const config = {
   /** Message limit per user before 429 (reset not implemented; consider daily reset later). */
   MESSAGE_QUOTA_PER_USER: parseInt(optionalEnv('MESSAGE_QUOTA_PER_USER', '50'), 10),
 
+  /** Companion / journal chat limit (separate from kitchen planner quota). */
+  COMPANION_MESSAGE_QUOTA_PER_USER: parseInt(optionalEnv('COMPANION_MESSAGE_QUOTA_PER_USER', '100'), 10),
+
   /** OpenAI model and max tokens. */
   OPENAI_MODEL: optionalEnv('OPENAI_MODEL', 'gpt-4o-mini'),
   OPENAI_MAX_TOKENS: parseInt(optionalEnv('OPENAI_MAX_TOKENS', '4096'), 10),
@@ -44,5 +47,5 @@ export const config = {
 } as const;
 
 /** Retailers supported for affiliate links. */
-export const RETAILERS = ['tesco', 'sainsburys'] as const;
+export const RETAILERS = ['tesco', 'sainsburys', 'asda', 'ocado'] as const;
 export type Retailer = (typeof RETAILERS)[number];

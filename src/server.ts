@@ -12,6 +12,18 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { config, RETAILERS, type Retailer } from './config';
 import { isAllowedImageUrl } from './recipeImages';
+import { buildCompanionSystemPrompt } from './prompts/companionPrompt';
+import {
+  loadCompanionMealContext,
+  formatMealContextForPrompt,
+  COMPANION_SUMMARY_PROMPT,
+} from './services/companionContext';
+import {
+  parseFeedback,
+  parseRepeat,
+  serializeMealFeedbackEntry,
+  type MealFeedbackRow,
+} from './services/mealFeedback';
 
 // Config is validated at import (config.ts); server exits if JWT_SECRET or OPENAI_API_KEY missing.
 
@@ -2367,6 +2379,10 @@ function buildRetailerUrl(retailer: Retailer): string {
       return `https://www.tesco.com/groceries/en-GB/?utm_source=${utmSource}`;
     case 'sainsburys':
       return `https://www.sainsburys.co.uk/gol-ui/groceries?utm_source=${utmSource}`;
+    case 'asda':
+      return `https://groceries.asda.com/?utm_source=${utmSource}`;
+    case 'ocado':
+      return `https://www.ocado.com/webshop/start?utm_source=${utmSource}`;
     default:
       throw new Error(`Unknown retailer: ${retailer}`);
   }
@@ -2390,6 +2406,202 @@ app.post('/affiliate-link', authenticateToken, async (req: Request, res: Respons
     res.json({ url });
   } catch (err) {
     log('ERROR', 'POST /affiliate-link failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Meal feedback (generalist matching engine learning loop)
+// ---------------------------------------------------------------------------
+
+app.get('/meal-feedback', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const result = await pool.query<MealFeedbackRow>(
+      `SELECT feedback_key, feedback, repeat, plan_id, recipe_title, day_label, meal_slot, calories, recorded_at
+       FROM meal_feedback
+       WHERE user_id = $1
+       ORDER BY recorded_at DESC
+       LIMIT 500`,
+      [user_id]
+    );
+    res.json({ entries: result.rows.map(serializeMealFeedbackEntry) });
+  } catch (err) {
+    log('ERROR', 'GET /meal-feedback failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/meal-feedback', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const { entries } = req.body ?? {};
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return res.status(400).json({ error: 'entries must be a non-empty array' });
+    }
+    if (entries.length > 200) {
+      return res.status(400).json({ error: 'Too many entries in one request' });
+    }
+
+    const client = await pool.connect();
+    try {
+      let upserted = 0;
+      for (const entry of entries) {
+        const key = typeof entry?.key === 'string' ? entry.key.trim().slice(0, 200) : '';
+        if (!key) continue;
+        const feedback = parseFeedback(entry.feedback);
+        const repeat = parseRepeat(entry.repeat);
+        if (!feedback && !repeat) continue;
+
+        const planId = Number(entry.planId) || null;
+        const recipeTitle = typeof entry.recipeTitle === 'string' ? entry.recipeTitle.trim().slice(0, 500) : null;
+        const day = typeof entry.day === 'string' ? entry.day.trim().slice(0, 20) : null;
+        const slot = typeof entry.slot === 'string' ? entry.slot.trim().slice(0, 20) : null;
+        const calories = Number(entry.calories) || null;
+        const recordedAt = Number(entry.recordedAt) || Date.now();
+
+        await client.query(
+          `INSERT INTO meal_feedback (user_id, feedback_key, feedback, repeat, plan_id, recipe_title, day_label, meal_slot, calories, recorded_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, to_timestamp($10 / 1000.0))
+           ON CONFLICT (user_id, feedback_key) DO UPDATE SET
+             feedback = COALESCE(EXCLUDED.feedback, meal_feedback.feedback),
+             repeat = COALESCE(EXCLUDED.repeat, meal_feedback.repeat),
+             plan_id = COALESCE(EXCLUDED.plan_id, meal_feedback.plan_id),
+             recipe_title = COALESCE(EXCLUDED.recipe_title, meal_feedback.recipe_title),
+             day_label = COALESCE(EXCLUDED.day_label, meal_feedback.day_label),
+             meal_slot = COALESCE(EXCLUDED.meal_slot, meal_feedback.meal_slot),
+             calories = COALESCE(EXCLUDED.calories, meal_feedback.calories),
+             recorded_at = EXCLUDED.recorded_at`,
+          [user_id, key, feedback, repeat, planId, recipeTitle, day, slot, calories, recordedAt]
+        );
+        upserted += 1;
+      }
+      res.json({ ok: true, upserted });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /meal-feedback failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Companion chat (private journal)
+// ---------------------------------------------------------------------------
+
+app.post('/companion/chat', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { user_message, conversation_id } = req.body;
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+
+    if (
+      typeof user_message !== 'string' ||
+      !user_message.trim() ||
+      typeof conversation_id !== 'string' ||
+      !conversation_id.trim() ||
+      user_id == null
+    ) {
+      return res.status(400).json({
+        error: 'Invalid request. Required: user_message (string), conversation_id (string). Auth token required.',
+      });
+    }
+    const convId = conversation_id.trim();
+    if (convId.length > 100 || !/^[a-zA-Z0-9_-]+$/.test(convId)) {
+      return res.status(400).json({
+        error: 'conversation_id must be 1–100 characters, alphanumeric, hyphen, or underscore only.',
+      });
+    }
+
+    const client = await pool.connect();
+    try {
+      const updateResult = await client.query<{ companion_message_count: number }>(
+        `UPDATE users SET companion_message_count = companion_message_count + 1
+         WHERE id = $1 AND companion_message_count < $2
+         RETURNING companion_message_count`,
+        [user_id, config.COMPANION_MESSAGE_QUOTA_PER_USER]
+      );
+      if (updateResult.rows.length === 0) {
+        return res.status(429).json({
+          error: `You have reached your ${config.COMPANION_MESSAGE_QUOTA_PER_USER} journal messages limit`,
+        });
+      }
+
+      await client.query(
+        'INSERT INTO chat_messages (user_id, sender, message_text, conversation_id) VALUES ($1, $2, $3, $4)',
+        [user_id, 'user', user_message.trim(), convId]
+      );
+
+      const prefsResult = await client.query<{
+        dietary_preferences: string | null;
+        allergies: string | null;
+        household_size: number | null;
+        default_budget: number | string | null;
+        preferred_retailer: string | null;
+      }>(
+        `SELECT dietary_preferences, allergies, household_size, default_budget, preferred_retailer
+         FROM users WHERE id = $1`,
+        [user_id]
+      );
+      const prefs = prefsResult.rows[0] ?? null;
+
+      const mealContext = await loadCompanionMealContext(client, user_id);
+      const mealContextBlock = formatMealContextForPrompt(mealContext);
+      const systemPrompt = buildCompanionSystemPrompt(prefs, mealContextBlock);
+
+      const historyResult = await client.query(
+        `SELECT sender, message_text FROM chat_messages
+         WHERE conversation_id = $1 AND user_id = $2
+         ORDER BY timestamp ASC`,
+        [convId, user_id]
+      );
+      const messages: ChatMessage[] = historyResult.rows.map((row: { sender: string; message_text: string }) => ({
+        role: row.sender === 'user' ? 'user' : 'assistant',
+        content: row.message_text,
+      }));
+
+      const assistantText = await callMealPlanningAPI(messages, systemPrompt, config.OPENAI_MAX_TOKENS);
+
+      await client.query(
+        'INSERT INTO chat_messages (user_id, sender, message_text, conversation_id) VALUES ($1, $2, $3, $4)',
+        [user_id, 'assistant', assistantText, convId]
+      );
+
+      res.json({
+        message: assistantText,
+        prompts: mealContext.prompts,
+      });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    log('ERROR', 'POST /companion/chat failed', { err: errMsg });
+    res.status(500).json({
+      error: 'Internal server error',
+      detail: process.env.NODE_ENV !== 'production' ? errMsg : undefined,
+    });
+  }
+});
+
+app.get('/companion/recent', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const client = await pool.connect();
+    try {
+      const mealContext = await loadCompanionMealContext(client, user_id);
+      res.json(mealContext);
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'GET /companion/recent failed', { err: String(err) });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
