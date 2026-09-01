@@ -1412,11 +1412,127 @@ app.post('/meal-plan', authenticateToken, async (req: Request, res: Response) =>
   }
 });
 
+app.patch('/meal-plan/:id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const planId = parseInt(req.params.id, 10);
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (isNaN(planId) || planId < 1) {
+      return res.status(400).json({ error: 'Invalid plan id.' });
+    }
+    if (user_id == null) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const { plan_name, servings, recipes } = req.body ?? {};
+    if (
+      typeof plan_name !== 'string' ||
+      !plan_name.trim() ||
+      typeof servings !== 'number' ||
+      !Number.isInteger(servings) ||
+      servings < 1 ||
+      !Array.isArray(recipes) ||
+      recipes.length === 0
+    ) {
+      return res.status(400).json({
+        error: 'Invalid request. Required: plan_name (string), servings (positive integer), recipes (non-empty array).',
+      });
+    }
+
+    const VALID_DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'] as const;
+    const VALID_MEAL_SLOTS = ['breakfast', 'lunch', 'dinner', 'snack'] as const;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const existing = await client.query<{ id: number }>(
+        'SELECT id FROM meal_plans WHERE id = $1 AND user_id = $2 FOR UPDATE',
+        [planId, user_id]
+      );
+      if (existing.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Meal plan not found' });
+      }
+
+      await client.query(
+        'UPDATE meal_plans SET plan_name = $1, servings = $2 WHERE id = $3',
+        [plan_name.trim(), servings, planId]
+      );
+      await client.query('DELETE FROM recipes WHERE meal_plan_id = $1', [planId]);
+
+      let totalEstimatedCost = 0;
+      for (const r of recipes) {
+        const rawDay = (r.day_of_week || '').toString();
+        const dayOfWeek = (VALID_DAYS as readonly string[]).includes(rawDay) ? rawDay : 'Monday';
+        const rawSlot = (r.meal_slot || '').toString();
+        const mealSlot = (VALID_MEAL_SLOTS as readonly string[]).includes(rawSlot) ? rawSlot : 'dinner';
+        const title = (r.title || 'Untitled').toString().slice(0, 255);
+        const instructions = (r.instructions || '').toString();
+        const prepTime = typeof r.prep_time === 'number' ? r.prep_time : null;
+        const cookTime = typeof r.cook_time === 'number' ? r.cook_time : null;
+        const estimatedCost = typeof r.estimated_cost === 'number' ? r.estimated_cost : 0;
+        const calories = typeof r.calories === 'number' ? r.calories : null;
+        const protein = typeof r.protein === 'number' ? r.protein : null;
+        const carbs = typeof r.carbs === 'number' ? r.carbs : null;
+        const fat = typeof r.fat === 'number' ? r.fat : null;
+
+        totalEstimatedCost += estimatedCost;
+
+        const recipeResult = await client.query<{ id: number }>(
+          `INSERT INTO recipes (meal_plan_id, day_of_week, meal_slot, title, instructions, prep_time, cook_time, estimated_cost, calories, protein, carbs, fat, image_url)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL) RETURNING id`,
+          [planId, dayOfWeek, mealSlot, title, instructions, prepTime, cookTime, estimatedCost, calories, protein, carbs, fat]
+        );
+        const recipeId = recipeResult.rows[0].id;
+
+        const ingredients = Array.isArray(r.ingredients) ? r.ingredients : [];
+        for (const ing of ingredients) {
+          const ingredientName = (ing.ingredient_name || 'Unknown').toString().slice(0, 255);
+          const quantity = typeof ing.quantity === 'number' ? ing.quantity : null;
+          const unit = ing.unit != null ? String(ing.unit).slice(0, 50) : null;
+          const category = ing.category != null ? String(ing.category).slice(0, 100) : null;
+          const estimatedPrice = typeof ing.estimated_price === 'number' ? ing.estimated_price : null;
+
+          await client.query(
+            `INSERT INTO ingredients (recipe_id, ingredient_name, quantity, unit, category, estimated_price)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [recipeId, ingredientName, quantity, unit, category, estimatedPrice]
+          );
+        }
+      }
+
+      await client.query(
+        'UPDATE meal_plans SET total_estimated_cost = $1 WHERE id = $2',
+        [totalEstimatedCost, planId]
+      );
+
+      await generateShoppingListForPlan(client, planId);
+      await client.query('COMMIT');
+
+      res.json({
+        meal_plan_id: planId,
+        id: planId,
+        plan_name: plan_name.trim(),
+        total_estimated_cost: totalEstimatedCost,
+        servings,
+        recipes_count: recipes.length,
+      });
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'PATCH /meal-plan/:id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.get('/meal-plans', authenticateToken, async (req: Request, res: Response) => {
   try {
     const user_id = (req as AuthenticatedRequest).user?.userId;
-    if (user_id == null) {
-      return res.status(401).json({ error: 'Authentication required.' });
+    if (user_id == null) {      return res.status(401).json({ error: 'Authentication required.' });
     }
 
     const result = await pool.query(
@@ -2720,6 +2836,62 @@ app.get('/companion/recent', authenticateToken, async (req: Request, res: Respon
   }
 });
 
+app.get('/companion/messages', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const conversationId = typeof req.query.conversation_id === 'string' ? req.query.conversation_id.trim() : '';
+    if (!conversationId) {
+      return res.json({ conversation_id: null, messages: [] });
+    }
+
+    const messages = await pool.query<{ id: number; sender: string; message_text: string; timestamp: Date }>(
+      `SELECT id, sender, message_text, timestamp
+       FROM chat_messages
+       WHERE conversation_id = $1 AND user_id = $2
+       ORDER BY timestamp ASC, id ASC`,
+      [conversationId, user_id]
+    );
+
+    res.json({
+      conversation_id: conversationId,
+      messages: messages.rows.map((row) => ({
+        id: row.id,
+        role: row.sender,
+        content: row.message_text,
+        created_at: row.timestamp,
+      })),
+    });
+  } catch (err) {
+    log('ERROR', 'GET /companion/messages failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/companion/reset', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const { conversation_id } = req.body ?? {};
+    if (typeof conversation_id !== 'string' || !conversation_id.trim()) {
+      return res.status(400).json({ error: 'conversation_id is required' });
+    }
+    const convId = conversation_id.trim().slice(0, 100);
+
+    await pool.query(
+      'DELETE FROM chat_messages WHERE conversation_id = $1 AND user_id = $2',
+      [convId, user_id]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    log('ERROR', 'POST /companion/reset failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Food log (journal — photo + text "what I ate/cooked")
 // ---------------------------------------------------------------------------
@@ -3275,6 +3447,98 @@ app.delete('/companion/food-log/:id', authenticateToken, async (req: Request, re
     res.json({ ok: true, summary });
   } catch (err) {
     log('ERROR', 'DELETE /companion/food-log/:id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.patch('/companion/food-log/:id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const logId = parseInt(req.params.id, 10);
+    if (isNaN(logId) || logId < 1) {
+      return res.status(400).json({ error: 'Invalid log id' });
+    }
+
+    const {
+      estimated_protein_g,
+      estimated_calories,
+      estimated_carbs_g,
+      estimated_fat_g,
+      description,
+      from,
+      to,
+    } = req.body ?? {};
+
+    const updates: string[] = [];
+    const values: unknown[] = [];
+    let idx = 1;
+
+    if (typeof estimated_protein_g === 'number' && estimated_protein_g >= 0) {
+      updates.push(`estimated_protein_g = $${idx++}`);
+      values.push(Math.round(estimated_protein_g));
+    }
+    if (typeof estimated_calories === 'number' && estimated_calories >= 0) {
+      updates.push(`estimated_calories = $${idx++}`);
+      values.push(Math.round(estimated_calories));
+    }
+    if (typeof estimated_carbs_g === 'number' && estimated_carbs_g >= 0) {
+      updates.push(`estimated_carbs_g = $${idx++}`);
+      values.push(Math.round(estimated_carbs_g));
+    }
+    if (typeof estimated_fat_g === 'number' && estimated_fat_g >= 0) {
+      updates.push(`estimated_fat_g = $${idx++}`);
+      values.push(Math.round(estimated_fat_g));
+    }
+    if (typeof description === 'string' && description.trim()) {
+      updates.push(`description = $${idx++}`);
+      values.push(description.trim().slice(0, 4000));
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No editable fields supplied' });
+    }
+
+    values.push(logId, user_id);
+
+    const updated = await pool.query(
+      `UPDATE food_logs SET ${updates.join(', ')}
+       WHERE id = $${idx} AND user_id = $${idx + 1}
+       RETURNING id, logged_at, description, items, estimated_protein_g,
+                 estimated_calories, estimated_carbs_g, estimated_fat_g,
+                 coach_note, meal_plan_id, recipe_title, source`,
+      values
+    );
+    if (!updated.rows[0]) return res.status(404).json({ error: 'Log not found' });
+
+    let planName: string | null = null;
+    if (updated.rows[0].meal_plan_id != null) {
+      const planRow = await pool.query<{ plan_name: string | null }>(
+        'SELECT plan_name FROM meal_plans WHERE id = $1',
+        [updated.rows[0].meal_plan_id]
+      );
+      planName = planRow.rows[0]?.plan_name ?? null;
+    }
+
+    let summary = null;
+    const range = parseFoodLogDayRange(from, to);
+    if (range) {
+      const sumResult = await pool.query<{ daily_total: string }>(
+        `SELECT COALESCE(SUM(estimated_calories), 0) AS daily_total
+         FROM food_logs
+         WHERE user_id = $1 AND logged_at >= $2 AND logged_at <= $3`,
+        [user_id, range.from.toISOString(), range.to.toISOString()]
+      );
+      summary = { daily_calories: Math.round(Number(sumResult.rows[0]?.daily_total ?? 0)) };
+    }
+
+    res.json({
+      log: serializeFoodLog({ ...updated.rows[0], plan_name: planName }),
+      summary,
+    });
+  } catch (err) {
+    log('ERROR', 'PATCH /companion/food-log/:id failed', { err: String(err) });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
