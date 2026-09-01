@@ -270,3 +270,18 @@ CREATE TABLE IF NOT EXISTS food_logs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_food_logs_user_logged ON food_logs(user_id, logged_at DESC);
+
+-- Journal entries (persistent private journal — saved or AI-summarized from companion chat)
+CREATE TABLE IF NOT EXISTS journal_entries (
+  id SERIAL PRIMARY KEY,
+  user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  conversation_id VARCHAR(100),
+  source_message_id INT REFERENCES chat_messages(id) ON DELETE SET NULL,
+  body TEXT NOT NULL,
+  meal_plan_id INT REFERENCES meal_plans(id) ON DELETE SET NULL,
+  recipe_title TEXT,
+  entry_kind VARCHAR(20) DEFAULT 'saved',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_entries_user_created ON journal_entries(user_id, created_at DESC);

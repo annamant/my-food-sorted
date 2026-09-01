@@ -2814,6 +2814,281 @@ app.get('/companion/food-log', authenticateToken, async (req: Request, res: Resp
 });
 
 // ---------------------------------------------------------------------------
+// Journal entries (persistent private journal)
+// ---------------------------------------------------------------------------
+
+app.get('/companion/journal', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const result = await pool.query<{
+      id: number;
+      body: string;
+      created_at: Date;
+      source_message_id: number | null;
+      meal_plan_id: number | null;
+      recipe_title: string | null;
+      entry_kind: string | null;
+      plan_name: string | null;
+    }>(
+      `SELECT je.id, je.body, je.created_at, je.source_message_id,
+              je.meal_plan_id, je.recipe_title, je.entry_kind, mp.plan_name
+       FROM journal_entries je
+       LEFT JOIN meal_plans mp ON mp.id = je.meal_plan_id
+       WHERE je.user_id = $1
+       ORDER BY je.created_at DESC, je.id DESC
+       LIMIT 200`,
+      [user_id]
+    );
+
+    res.json({
+      entries: result.rows.map((row) => ({
+        id: row.id,
+        body: row.body,
+        created_at: row.created_at,
+        source_message_id: row.source_message_id,
+        meal_plan_id: row.meal_plan_id,
+        recipe_title: row.recipe_title,
+        entry_kind: row.entry_kind ?? 'saved',
+        plan_name: row.plan_name,
+      })),
+    });
+  } catch (err) {
+    log('ERROR', 'GET /companion/journal failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/companion/journal', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const { body, source_message_id, meal_plan_id, recipe_title, conversation_id } = req.body ?? {};
+    if (typeof body !== 'string' || !body.trim()) {
+      return res.status(400).json({ error: 'body is required' });
+    }
+    if (body.trim().length > 8000) {
+      return res.status(400).json({ error: 'Entry is too long' });
+    }
+
+    let linkedPlanId: number | null = null;
+    if (meal_plan_id != null) {
+      const parsed = Number(meal_plan_id);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        return res.status(400).json({ error: 'Invalid meal_plan_id' });
+      }
+      linkedPlanId = parsed;
+    }
+
+    const linkedRecipeTitle =
+      typeof recipe_title === 'string' && recipe_title.trim() ? recipe_title.trim().slice(0, 500) : null;
+
+    const convId =
+      typeof conversation_id === 'string' && conversation_id.trim() ? conversation_id.trim().slice(0, 100) : null;
+
+    const client = await pool.connect();
+    try {
+      if (linkedPlanId != null) {
+        const ownedPlan = await client.query(
+          'SELECT id FROM meal_plans WHERE id = $1 AND user_id = $2',
+          [linkedPlanId, user_id]
+        );
+        if (!ownedPlan.rows[0]) {
+          return res.status(404).json({ error: 'Meal plan not found' });
+        }
+      }
+
+      const inserted = await client.query<{
+        id: number;
+        body: string;
+        created_at: Date;
+        meal_plan_id: number | null;
+        recipe_title: string | null;
+        entry_kind: string | null;
+      }>(
+        `INSERT INTO journal_entries (
+           user_id, conversation_id, source_message_id, body,
+           meal_plan_id, recipe_title, entry_kind
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, 'saved')
+         RETURNING id, body, created_at, meal_plan_id, recipe_title, entry_kind`,
+        [user_id, convId, source_message_id ?? null, body.trim(), linkedPlanId, linkedRecipeTitle]
+      );
+
+      let planName: string | null = null;
+      if (linkedPlanId != null) {
+        const planRow = await client.query<{ plan_name: string | null }>(
+          'SELECT plan_name FROM meal_plans WHERE id = $1',
+          [linkedPlanId]
+        );
+        planName = planRow.rows[0]?.plan_name ?? null;
+      }
+
+      const row = inserted.rows[0];
+      res.json({
+        entry: {
+          ...row,
+          entry_kind: row.entry_kind ?? 'saved',
+          plan_name: planName,
+        },
+      });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /companion/journal failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/companion/journal/summarize', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const { conversation_id, meal_plan_id, recipe_title } = req.body ?? {};
+    if (typeof conversation_id !== 'string' || !conversation_id.trim()) {
+      return res.status(400).json({ error: 'conversation_id is required' });
+    }
+    const convId = conversation_id.trim().slice(0, 100);
+
+    let linkedPlanId: number | null = null;
+    if (meal_plan_id != null) {
+      const parsed = Number(meal_plan_id);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        return res.status(400).json({ error: 'Invalid meal_plan_id' });
+      }
+      linkedPlanId = parsed;
+    }
+
+    const linkedRecipeTitle =
+      typeof recipe_title === 'string' && recipe_title.trim() ? recipe_title.trim().slice(0, 500) : null;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const quotaResult = await client.query<{ companion_message_count: number }>(
+        `UPDATE users SET companion_message_count = companion_message_count + 1
+         WHERE id = $1 AND companion_message_count < $2
+         RETURNING companion_message_count`,
+        [user_id, config.COMPANION_MESSAGE_QUOTA_PER_USER]
+      );
+      if (quotaResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(429).json({
+          error: `You have reached your ${config.COMPANION_MESSAGE_QUOTA_PER_USER} journal messages limit`,
+        });
+      }
+
+      const historyResult = await client.query<{ role: string; content: string }>(
+        `SELECT sender AS role, message_text AS content FROM chat_messages
+         WHERE conversation_id = $1 AND user_id = $2
+         ORDER BY timestamp ASC, id ASC`,
+        [convId, user_id]
+      );
+
+      if (historyResult.rows.length < 2) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Chat a little longer before summarizing' });
+      }
+
+      if (linkedPlanId != null) {
+        const ownedPlan = await client.query(
+          'SELECT id FROM meal_plans WHERE id = $1 AND user_id = $2',
+          [linkedPlanId, user_id]
+        );
+        if (!ownedPlan.rows[0]) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({ error: 'Meal plan not found' });
+        }
+      }
+
+      const transcript = historyResult.rows
+        .map((row) => `${row.role === 'assistant' ? 'Companion' : 'User'}: ${row.content}`)
+        .join('\n\n');
+
+      const summaryText = await callMealPlanningAPI(
+        [{ role: 'user', content: transcript }],
+        COMPANION_SUMMARY_PROMPT,
+        Math.min(config.OPENAI_MAX_TOKENS, 800)
+      );
+
+      const inserted = await client.query<{
+        id: number;
+        body: string;
+        created_at: Date;
+        meal_plan_id: number | null;
+        recipe_title: string | null;
+        entry_kind: string | null;
+      }>(
+        `INSERT INTO journal_entries (
+           user_id, conversation_id, body, meal_plan_id, recipe_title, entry_kind
+         )
+         VALUES ($1, $2, $3, $4, $5, 'summary')
+         RETURNING id, body, created_at, meal_plan_id, recipe_title, entry_kind`,
+        [user_id, convId, summaryText.trim(), linkedPlanId, linkedRecipeTitle]
+      );
+
+      await client.query('COMMIT');
+
+      let planName: string | null = null;
+      if (linkedPlanId != null) {
+        const planRow = await client.query<{ plan_name: string | null }>(
+          'SELECT plan_name FROM meal_plans WHERE id = $1',
+          [linkedPlanId]
+        );
+        planName = planRow.rows[0]?.plan_name ?? null;
+      }
+
+      const row = inserted.rows[0];
+      res.json({
+        entry: {
+          ...row,
+          entry_kind: row.entry_kind ?? 'summary',
+          plan_name: planName,
+        },
+        companion_message_count: quotaResult.rows[0].companion_message_count,
+        companion_message_quota: config.COMPANION_MESSAGE_QUOTA_PER_USER,
+      });
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    log('ERROR', 'POST /companion/journal/summarize failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/companion/journal/:id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user_id = (req as AuthenticatedRequest).user?.userId;
+    if (user_id == null) return res.status(401).json({ error: 'Authentication required.' });
+
+    const entryId = parseInt(req.params.id, 10);
+    if (isNaN(entryId) || entryId < 1) {
+      return res.status(400).json({ error: 'Invalid entry id' });
+    }
+
+    const result = await pool.query(
+      'DELETE FROM journal_entries WHERE id = $1 AND user_id = $2 RETURNING id',
+      [entryId, user_id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Entry not found' });
+
+    res.json({ ok: true });
+  } catch (err) {
+    log('ERROR', 'DELETE /companion/journal/:id failed', { err: String(err) });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 404 & Error Handlers
 // ---------------------------------------------------------------------------
 
